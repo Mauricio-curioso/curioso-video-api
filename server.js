@@ -20,31 +20,41 @@ fs.mkdirSync(TEMP_DIR, { recursive: true });
 app.use("/videos", express.static(OUTPUT_DIR));
 
 /*
-  Armazena os jobs em memoria.
-  Nesta primeira versao de teste isso e suficiente.
+  Jobs ficam em memoria nesta versao.
+  Para testes e suficiente.
 */
 const jobs = new Map();
 
+/*
+  ROTA PRINCIPAL
+*/
 app.get("/", (req, res) => {
   res.json({
     success: true,
     service: "Curioso AI Video API",
     status: "online",
-    mode: "async"
+    mode: "async",
+    resolution: "1080x1920",
+    fps: 30
   });
 });
 
+/*
+  HEALTH CHECK
+*/
 app.get("/health", (req, res) => {
   res.json({
     success: true,
     status: "healthy",
     ffmpeg: true,
-    mode: "async"
+    mode: "async",
+    resolution: "1080x1920",
+    fps: 30
   });
 });
 
 /*
-  CONSULTAR STATUS
+  CONSULTAR STATUS DO JOB
 */
 app.get("/status/:jobId", (req, res) => {
   const job = jobs.get(req.params.jobId);
@@ -59,6 +69,9 @@ app.get("/status/:jobId", (req, res) => {
   res.json(job);
 });
 
+/*
+  BAIXAR ARQUIVO
+*/
 async function downloadFile(url, destination) {
   console.log(`Baixando: ${url}`);
 
@@ -84,6 +97,9 @@ async function downloadFile(url, destination) {
   });
 }
 
+/*
+  EXECUTAR FFMPEG
+*/
 function runFFmpeg(args, etapa) {
   return new Promise((resolve, reject) => {
     console.log(`FFmpeg iniciado: ${etapa}`);
@@ -107,7 +123,6 @@ function runFFmpeg(args, etapa) {
         }
 
         console.log(`FFmpeg concluido: ${etapa}`);
-
         resolve();
       }
     );
@@ -115,7 +130,7 @@ function runFFmpeg(args, etapa) {
 }
 
 /*
-  PROCESSAMENTO DO VIDEO
+  PROCESSAMENTO EM SEGUNDO PLANO
 */
 async function processVideo(jobId, data, baseUrl) {
   const jobDir = path.join(TEMP_DIR, jobId);
@@ -126,7 +141,7 @@ async function processVideo(jobId, data, baseUrl) {
     const {
       images,
       audioUrl,
-      duration = 6
+      duration = 60
     } = data;
 
     jobs.set(jobId, {
@@ -142,12 +157,13 @@ async function processVideo(jobId, data, baseUrl) {
     console.log(`PROCESSANDO JOB: ${jobId}`);
     console.log(`Imagens: ${images.length}`);
     console.log(`Duracao: ${duration}s`);
+    console.log("Resolucao: 1080x1920");
+    console.log("FPS: 30");
     console.log("=====================================");
 
     /*
-      ETAPA 1 - IMAGENS
+      ETAPA 1 - BAIXAR IMAGENS
     */
-
     jobs.set(jobId, {
       success: true,
       jobId,
@@ -164,15 +180,17 @@ async function processVideo(jobId, data, baseUrl) {
         `image-${String(i).padStart(3, "0")}.jpg`
       );
 
-      await downloadFile(images[i], imagePath);
+      await downloadFile(
+        images[i],
+        imagePath
+      );
 
       imagePaths.push(imagePath);
     }
 
     /*
-      ETAPA 2 - AUDIO
+      ETAPA 2 - BAIXAR AUDIO
     */
-
     jobs.set(jobId, {
       success: true,
       jobId,
@@ -186,12 +204,14 @@ async function processVideo(jobId, data, baseUrl) {
       "narration.mp3"
     );
 
-    await downloadFile(audioUrl, audioPath);
+    await downloadFile(
+      audioUrl,
+      audioPath
+    );
 
     /*
-      ETAPA 3 - CENAS
+      ETAPA 3 - CRIAR CENAS
     */
-
     const sceneDuration =
       duration / images.length;
 
@@ -220,7 +240,7 @@ async function processVideo(jobId, data, baseUrl) {
 
       const frames = Math.max(
         1,
-        Math.round(sceneDuration * 24)
+        Math.round(sceneDuration * 30)
       );
 
       await runFFmpeg(
@@ -232,11 +252,11 @@ async function processVideo(jobId, data, baseUrl) {
           "-i", imagePaths[i],
 
           "-vf",
-          `scale=540:960:force_original_aspect_ratio=increase,crop=540:960,zoompan=z='min(zoom+0.0015,1.08)':d=${frames}:s=540x960:fps=24,format=yuv420p`,
+          `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(zoom+0.0012,1.08)':d=${frames}:s=1080x1920:fps=30,format=yuv420p`,
 
           "-t", String(sceneDuration),
 
-          "-r", "24",
+          "-r", "30",
 
           "-c:v", "libx264",
 
@@ -255,9 +275,8 @@ async function processVideo(jobId, data, baseUrl) {
     }
 
     /*
-      ETAPA 4 - CONCATENAR
+      ETAPA 4 - JUNTAR CENAS
     */
-
     jobs.set(jobId, {
       success: true,
       jobId,
@@ -295,9 +314,8 @@ async function processVideo(jobId, data, baseUrl) {
     );
 
     /*
-      ETAPA 5 - AUDIO
+      ETAPA 5 - ADICIONAR AUDIO
     */
-
     jobs.set(jobId, {
       success: true,
       jobId,
@@ -342,9 +360,8 @@ async function processVideo(jobId, data, baseUrl) {
       `${baseUrl}/videos/${outputFilename}`;
 
     /*
-      CONCLUIDO
+      JOB CONCLUIDO
     */
-
     jobs.set(jobId, {
       success: true,
       jobId,
@@ -352,7 +369,8 @@ async function processVideo(jobId, data, baseUrl) {
       progress: 100,
       message: "Video concluido",
       videoUrl,
-      resolution: "540x960",
+      resolution: "1080x1920",
+      fps: 30,
       format: "mp4",
       duration
     });
@@ -362,6 +380,8 @@ async function processVideo(jobId, data, baseUrl) {
     console.log("VIDEO CONCLUIDO");
     console.log(`JOB: ${jobId}`);
     console.log(`URL: ${videoUrl}`);
+    console.log("RESOLUCAO: 1080x1920");
+    console.log("FPS: 30");
     console.log("=====================================");
 
   } catch (error) {
@@ -400,13 +420,13 @@ async function processVideo(jobId, data, baseUrl) {
 }
 
 /*
-  CRIAR NOVO JOB
+  RECEBER NOVA RENDERIZACAO
 */
 app.post("/render", (req, res) => {
   const {
     images,
     audioUrl,
-    duration = 6
+    duration = 60
   } = req.body;
 
   if (
@@ -447,7 +467,7 @@ app.post("/render", (req, res) => {
     `${protocol}://${host}`;
 
   /*
-    Inicia o processamento SEM esperar terminar.
+    PROCESSA SEM BLOQUEAR A RESPOSTA
   */
   setImmediate(() => {
     processVideo(
@@ -462,7 +482,7 @@ app.post("/render", (req, res) => {
   });
 
   /*
-    Responde imediatamente.
+    DEVOLVE JOB ID IMEDIATAMENTE
   */
   res.status(202).json({
     success: true,
@@ -474,12 +494,15 @@ app.post("/render", (req, res) => {
   });
 });
 
+/*
+  INICIAR SERVIDOR
+*/
 app.listen(
   PORT,
   "0.0.0.0",
   () => {
     console.log(
-      `Curioso AI Video API assincrona rodando na porta ${PORT}`
+      `Curioso AI Video API Full HD assincrona rodando na porta ${PORT}`
     );
   }
 );
