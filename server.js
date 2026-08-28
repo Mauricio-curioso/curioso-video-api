@@ -3,7 +3,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
-const { v4: uuidv4 } = require("uuid");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -18,11 +18,6 @@ fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 app.use("/videos", express.static(OUTPUT_DIR));
-
-
-// ===============================
-// TESTE DA API
-// ===============================
 
 app.get("/", (req, res) => {
   res.json({
@@ -40,92 +35,100 @@ app.get("/health", (req, res) => {
   });
 });
 
-
-// ===============================
-// FUNÇÕES AUXILIARES
-// ===============================
-
 async function downloadFile(url, destination) {
+  console.log(`Baixando: ${url}`);
+
   const response = await axios({
     method: "GET",
     url,
     responseType: "stream",
-    timeout: 60000
+    timeout: 120000,
+    maxRedirects: 10
   });
 
   const writer = fs.createWriteStream(destination);
-
   response.data.pipe(writer);
 
   return new Promise((resolve, reject) => {
-    writer.on("finish", resolve);
+    writer.on("finish", () => {
+      console.log(`Download concluido: ${destination}`);
+      resolve();
+    });
+
     writer.on("error", reject);
   });
 }
 
-
-function runFFmpeg(args) {
+function runFFmpeg(args, etapa) {
   return new Promise((resolve, reject) => {
+    console.log(`FFmpeg iniciado: ${etapa}`);
 
-    execFile("ffmpeg", args, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
+    execFile(
+      "ffmpeg",
+      args,
+      {
+        maxBuffer: 1024 * 1024 * 20
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          console.error(`ERRO FFMPEG - ${etapa}`);
+          console.error(stderr);
+          reject(new Error(stderr || error.message));
+          return;
+        }
 
-      if (error) {
-        console.error(stderr);
-        reject(new Error(stderr || error.message));
-        return;
+        console.log(`FFmpeg concluido: ${etapa}`);
+        resolve();
       }
-
-      resolve();
-    });
-
+    );
   });
 }
 
-
-// ===============================
-// RENDERIZAÇÃO
-// ===============================
-
 app.post("/render", async (req, res) => {
 
-  const jobId = uuidv4();
-
+  const jobId = crypto.randomUUID();
   const jobDir = path.join(TEMP_DIR, jobId);
 
   fs.mkdirSync(jobDir, { recursive: true });
+
+  console.log("");
+  console.log("=====================================");
+  console.log(`POST /render recebido`);
+  console.log(`Job ID: ${jobId}`);
+  console.log("=====================================");
 
   try {
 
     const {
       images,
       audioUrl,
-      duration = 30
+      duration = 6
     } = req.body;
 
+    console.log(`Quantidade de imagens: ${images?.length || 0}`);
+    console.log(`Duracao solicitada: ${duration}s`);
 
     if (!images || !Array.isArray(images) || images.length === 0) {
+
+      console.log("ERRO: nenhuma imagem recebida");
 
       return res.status(400).json({
         success: false,
         error: "Nenhuma imagem recebida."
       });
-
     }
-
 
     if (!audioUrl) {
 
+      console.log("ERRO: audioUrl nao informado");
+
       return res.status(400).json({
         success: false,
-        error: "audioUrl não informado."
+        error: "audioUrl nao informado."
       });
-
     }
 
-
-    // ===============================
-    // BAIXAR IMAGENS
-    // ===============================
+    console.log("ETAPA 1: baixando imagens");
 
     const imagePaths = [];
 
@@ -141,28 +144,28 @@ app.post("/render", async (req, res) => {
       imagePaths.push(imagePath);
     }
 
+    console.log("ETAPA 1 concluida");
 
-    // ===============================
-    // BAIXAR NARRAÇÃO
-    // ===============================
+    console.log("ETAPA 2: baixando audio");
 
-    const audioPath = path.join(jobDir, "narration.mp3");
+    const audioPath = path.join(
+      jobDir,
+      "narration.mp3"
+    );
 
-    await downloadFile(audioUrl, audioPath);
+    await downloadFile(
+      audioUrl,
+      audioPath
+    );
 
+    console.log("ETAPA 2 concluida");
 
-    // ===============================
-    // DURAÇÃO DE CADA CENA
-    // ===============================
-
-    const sceneDuration = duration / images.length;
-
-
-    // ===============================
-    // CRIAR VÍDEOS DAS CENAS
-    // ===============================
+    const sceneDuration =
+      duration / images.length;
 
     const sceneVideos = [];
+
+    console.log("ETAPA 3: criando cenas");
 
     for (let i = 0; i < imagePaths.length; i++) {
 
@@ -171,161 +174,150 @@ app.post("/render", async (req, res) => {
         `scene-${String(i).padStart(3, "0")}.mp4`
       );
 
+      const frames =
+        Math.max(1, Math.round(sceneDuration * 24));
 
-      const frames = Math.round(sceneDuration * 30);
+      await runFFmpeg(
+        [
+          "-y",
+          "-loop", "1",
+          "-i", imagePaths[i],
 
+          "-vf",
+          `scale=540:960:force_original_aspect_ratio=increase,crop=540:960,zoompan=z='min(zoom+0.0015,1.08)':d=${frames}:s=540x960:fps=24,format=yuv420p`,
 
-      await runFFmpeg([
+          "-t", String(sceneDuration),
 
-        "-y",
+          "-r", "24",
 
-        "-loop", "1",
+          "-c:v", "libx264",
 
-        "-i", imagePaths[i],
+          "-preset", "ultrafast",
 
-        "-vf",
+          "-crf", "28",
 
-        `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(zoom+0.0008,1.08)':d=${frames}:s=1080x1920:fps=30,format=yuv420p`,
+          "-pix_fmt", "yuv420p",
 
-        "-t", String(sceneDuration),
-
-        "-r", "30",
-
-        "-c:v", "libx264",
-
-        "-preset", "veryfast",
-
-        "-pix_fmt", "yuv420p",
-
-        sceneVideo
-
-      ]);
-
+          sceneVideo
+        ],
+        `Cena ${i + 1}/${imagePaths.length}`
+      );
 
       sceneVideos.push(sceneVideo);
-
     }
 
+    console.log("ETAPA 3 concluida");
 
-    // ===============================
-    // LISTA DE CENAS
-    // ===============================
+    console.log("ETAPA 4: juntando cenas");
 
-    const concatFile = path.join(jobDir, "concat.txt");
+    const concatFile =
+      path.join(jobDir, "concat.txt");
 
-    const concatContent = sceneVideos
-      .map(video => `file '${video}'`)
-      .join("\n");
+    const concatContent =
+      sceneVideos
+        .map(video => `file '${video}'`)
+        .join("\n");
 
-    fs.writeFileSync(concatFile, concatContent);
-
-
-    const videoWithoutAudio = path.join(jobDir, "video.mp4");
-
-
-    // ===============================
-    // JUNTAR CENAS
-    // ===============================
-
-    await runFFmpeg([
-
-      "-y",
-
-      "-f", "concat",
-
-      "-safe", "0",
-
-      "-i", concatFile,
-
-      "-c", "copy",
-
-      videoWithoutAudio
-
-    ]);
-
-
-    // ===============================
-    // ADICIONAR NARRAÇÃO
-    // ===============================
-
-    const outputFilename = `${jobId}.mp4`;
-
-    const outputPath = path.join(
-      OUTPUT_DIR,
-      outputFilename
+    fs.writeFileSync(
+      concatFile,
+      concatContent
     );
 
+    const videoWithoutAudio =
+      path.join(jobDir, "video.mp4");
 
-    await runFFmpeg([
+    await runFFmpeg(
+      [
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concatFile,
+        "-c", "copy",
+        videoWithoutAudio
+      ],
+      "Concatenacao"
+    );
 
-      "-y",
+    console.log("ETAPA 4 concluida");
 
-      "-i", videoWithoutAudio,
+    console.log("ETAPA 5: adicionando audio");
 
-      "-i", audioPath,
+    const outputFilename =
+      `${jobId}.mp4`;
 
-      "-c:v", "copy",
+    const outputPath =
+      path.join(
+        OUTPUT_DIR,
+        outputFilename
+      );
 
-      "-c:a", "aac",
+    await runFFmpeg(
+      [
+        "-y",
 
-      "-b:a", "192k",
+        "-i", videoWithoutAudio,
 
-      "-shortest",
+        "-i", audioPath,
 
-      "-movflags", "+faststart",
+        "-c:v", "copy",
 
-      outputPath
+        "-c:a", "aac",
 
-    ]);
+        "-b:a", "128k",
 
+        "-shortest",
 
-    // ===============================
-    // URL DO VÍDEO
-    // ===============================
+        "-movflags", "+faststart",
+
+        outputPath
+      ],
+      "Video final"
+    );
+
+    console.log("ETAPA 5 concluida");
 
     const protocol =
-      req.headers["x-forwarded-proto"] || req.protocol;
+      req.headers["x-forwarded-proto"] ||
+      req.protocol;
 
     const host = req.get("host");
 
     const videoUrl =
       `${protocol}://${host}/videos/${outputFilename}`;
 
+    console.log("=====================================");
+    console.log("VIDEO CONCLUIDO");
+    console.log(`Job: ${jobId}`);
+    console.log(`URL: ${videoUrl}`);
+    console.log("=====================================");
 
     res.json({
-
       success: true,
-
       jobId,
-
       status: "completed",
-
       videoUrl,
-
-      resolution: "1080x1920",
-
-      format: "mp4"
-
+      resolution: "540x960",
+      format: "mp4",
+      duration
     });
-
 
   } catch (error) {
 
-    console.error("ERRO NA RENDERIZAÇÃO:", error);
+    console.error("");
+    console.error("=====================================");
+    console.error("ERRO NA RENDERIZACAO");
+    console.error(`Job: ${jobId}`);
+    console.error(error);
+    console.error("=====================================");
 
     res.status(500).json({
-
       success: false,
-
+      jobId,
       status: "error",
-
       error: error.message
-
     });
 
   } finally {
-
-    // Limpa arquivos temporários depois de 5 minutos
 
     setTimeout(() => {
 
@@ -335,24 +327,23 @@ app.post("/render", async (req, res) => {
           recursive: true,
           force: true
         },
-        () => {}
+        () => {
+          console.log(
+            `Arquivos temporarios removidos: ${jobId}`
+          );
+        }
       );
 
     }, 300000);
-
   }
-
 });
 
-
-// ===============================
-// INICIAR SERVIDOR
-// ===============================
-
-app.listen(PORT, "0.0.0.0", () => {
-
-  console.log(
-    `Curioso AI Video API rodando na porta ${PORT}`
-  );
-
-});
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `Curioso AI Video API rodando na porta ${PORT}`
+    );
+  }
+);
