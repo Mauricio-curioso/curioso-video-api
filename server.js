@@ -6,7 +6,6 @@ const { execFile } = require("child_process");
 const crypto = require("crypto");
 
 const app = express();
-
 app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || 10000;
@@ -21,16 +20,25 @@ app.use("/videos", express.static(OUTPUT_DIR));
 
 const jobs = new Map();
 
-/*
-  SEGURANCA DA API
-*/
+function runFFmpeg(args) {
+  return new Promise((resolve, reject) => {
+    execFile("ffmpeg", args, (error, stdout, stderr) => {
+      if (error) {
+        console.error(stderr);
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
 function requireApiKey(req, res, next) {
   const expectedKey = process.env.VIDEO_API_KEY;
   const receivedKey = req.get("x-api-key");
 
   if (!expectedKey) {
-    console.error("VIDEO_API_KEY nao configurada no servidor.");
-
     return res.status(503).json({
       success: false,
       error: "API ainda nao configurada."
@@ -60,488 +68,340 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-/*
-  PAGINA PRINCIPAL
-*/
-app.get("/", (req, res) => {
-  res.json({
-    success: true,
-    service: "Curioso AI Video API",
-    status: "online",
-    mode: "async",
-    security: "enabled",
-    resolution: "1080x1920",
-    fps: 30
-  });
-});
-
-/*
-  HEALTH CHECK
-*/
-app.get("/health", (req, res) => {
-  res.json({
-    success: true,
-    status: "healthy",
-    ffmpeg: true,
-    mode: "async",
-    security: "enabled",
-    resolution: "1080x1920",
-    fps: 30
-  });
-});
-
-/*
-  CONSULTAR STATUS
-  AGORA EXIGE API KEY
-*/
-app.get(
-  "/status/:jobId",
-  requireApiKey,
-  (req, res) => {
-    const job = jobs.get(req.params.jobId);
-
-    if (!job) {
-      return res.status(404).json({
-        success: false,
-        error: "Job nao encontrado."
-      });
-    }
-
-    res.json(job);
-  }
-);
-
-/*
-  DOWNLOAD DE ARQUIVOS
-*/
 async function downloadFile(url, destination) {
-  console.log(`Baixando: ${url}`);
-
   const response = await axios({
     method: "GET",
     url,
     responseType: "stream",
-    timeout: 120000,
-    maxRedirects: 10
+    timeout: 60000
   });
 
-  const writer = fs.createWriteStream(destination);
-
-  response.data.pipe(writer);
-
   return new Promise((resolve, reject) => {
-    writer.on("finish", () => {
-      console.log(`Download concluido: ${destination}`);
-      resolve();
-    });
+    const writer = fs.createWriteStream(destination);
 
+    response.data.pipe(writer);
+
+    writer.on("finish", resolve);
     writer.on("error", reject);
   });
 }
 
-/*
-  EXECUTAR FFMPEG
-*/
-function runFFmpeg(args, etapa) {
-  return new Promise((resolve, reject) => {
-    console.log(`FFmpeg iniciado: ${etapa}`);
-
-    execFile(
-      "ffmpeg",
-      args,
-      {
-        maxBuffer: 1024 * 1024 * 20
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          console.error(`ERRO FFMPEG - ${etapa}`);
-          console.error(stderr);
-
-          reject(
-            new Error(stderr || error.message)
-          );
-
-          return;
-        }
-
-        console.log(`FFmpeg concluido: ${etapa}`);
-        resolve();
-      }
-    );
-  });
+function escapeSubtitleText(text) {
+  return String(text)
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/:/g, "\\:")
+    .replace(/%/g, "\\%");
 }
 
-/*
-  PROCESSAMENTO EM SEGUNDO PLANO
-*/
-async function processVideo(jobId, data, baseUrl) {
-  const jobDir = path.join(TEMP_DIR, jobId);
+async function processVideo(jobId, data) {
+  const job = jobs.get(jobId);
 
+  const {
+    images,
+    audioUrl,
+    duration = 60,
+    captions = []
+  } = data;
+
+  const jobDir = path.join(TEMP_DIR, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
 
   try {
-    const {
-      images,
-      audioUrl,
-      duration = 60
-    } = data;
+    job.status = "processing";
+    job.progress = 5;
+    job.message = "Baixando arquivos";
 
-    jobs.set(jobId, {
-      success: true,
-      jobId,
-      status: "processing",
-      progress: 5,
-      message: "Iniciando renderizacao"
-    });
-
-    console.log("");
-    console.log("=====================================");
-    console.log(`PROCESSANDO JOB: ${jobId}`);
-    console.log(`Imagens: ${images.length}`);
-    console.log(`Duracao: ${duration}s`);
-    console.log("Resolucao: 1080x1920");
-    console.log("FPS: 30");
-    console.log("=====================================");
-
-    /*
-      ETAPA 1 - BAIXAR IMAGENS
-    */
-    jobs.set(jobId, {
-      success: true,
-      jobId,
-      status: "processing",
-      progress: 10,
-      message: "Baixando imagens"
-    });
-
-    const imagePaths = [];
+    const imageFiles = [];
 
     for (let i = 0; i < images.length; i++) {
-      const imagePath = path.join(
-        jobDir,
-        `image-${String(i).padStart(3, "0")}.jpg`
-      );
+      const imagePath = path.join(jobDir, `image-${i}.jpg`);
 
-      await downloadFile(
-        images[i],
-        imagePath
-      );
+      await downloadFile(images[i], imagePath);
 
-      imagePaths.push(imagePath);
+      imageFiles.push(imagePath);
     }
 
-    /*
-      ETAPA 2 - BAIXAR AUDIO
-    */
-    jobs.set(jobId, {
-      success: true,
-      jobId,
-      status: "processing",
-      progress: 25,
-      message: "Baixando audio"
-    });
+    const audioPath = path.join(jobDir, "audio.mp3");
 
-    const audioPath = path.join(
-      jobDir,
-      "narration.mp3"
+    await downloadFile(audioUrl, audioPath);
+
+    job.progress = 20;
+    job.message = "Criando cenas";
+
+    const sceneDuration = duration / images.length;
+
+    const sceneFiles = [];
+
+    for (let i = 0; i < imageFiles.length; i++) {
+      const scenePath = path.join(jobDir, `scene-${i}.mp4`);
+
+      job.progress =
+        20 + Math.round(((i + 1) / imageFiles.length) * 35);
+
+      job.message = `Criando cena ${i + 1} de ${imageFiles.length}`;
+
+      await runFFmpeg([
+        "-y",
+        "-loop",
+        "1",
+        "-i",
+        imageFiles[i],
+
+        "-vf",
+        [
+          "scale=1080:1920:force_original_aspect_ratio=increase",
+          "crop=1080:1920",
+          "zoompan=z='min(zoom+0.0007,1.08)':d=1:s=1080x1920:fps=30",
+          "format=yuv420p"
+        ].join(","),
+
+        "-t",
+        String(sceneDuration),
+
+        "-r",
+        "30",
+
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        "ultrafast",
+
+        "-crf",
+        "28",
+
+        scenePath
+      ]);
+
+      sceneFiles.push(scenePath);
+    }
+
+    job.progress = 60;
+    job.message = "Juntando cenas";
+
+    const concatList = path.join(jobDir, "concat.txt");
+
+    const concatContent = sceneFiles
+      .map(file => `file '${file.replace(/'/g, "'\\''")}'`)
+      .join("\n");
+
+    fs.writeFileSync(concatList, concatContent);
+
+    const mergedVideo = path.join(jobDir, "merged.mp4");
+
+    await runFFmpeg([
+      "-y",
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      concatList,
+      "-c",
+      "copy",
+      mergedVideo
+    ]);
+
+    job.progress = 70;
+    job.message = "Adicionando audio";
+
+    const videoWithAudio = path.join(jobDir, "audio-video.mp4");
+
+    await runFFmpeg([
+      "-y",
+      "-i",
+      mergedVideo,
+      "-i",
+      audioPath,
+
+      "-map",
+      "0:v:0",
+
+      "-map",
+      "1:a:0",
+
+      "-c:v",
+      "copy",
+
+      "-c:a",
+      "aac",
+
+      "-b:a",
+      "192k",
+
+      "-shortest",
+
+      videoWithAudio
+    ]);
+
+    job.progress = 82;
+    job.message = "Adicionando legendas";
+
+    const outputPath = path.join(
+      OUTPUT_DIR,
+      `${jobId}.mp4`
     );
 
-    await downloadFile(
-      audioUrl,
-      audioPath
-    );
+    if (captions.length > 0) {
+      const drawTextFilters = captions.map(caption => {
+        const text = escapeSubtitleText(caption.text);
 
-    /*
-      ETAPA 3 - CRIAR CENAS
-    */
-    const sceneDuration =
-      duration / images.length;
+        const start = Number(caption.start) || 0;
+        const end = Number(caption.end) || duration;
 
-    const sceneVideos = [];
-
-    for (let i = 0; i < imagePaths.length; i++) {
-      const progress =
-        30 +
-        Math.round(
-          ((i + 1) / imagePaths.length) * 40
+        return (
+          `drawtext=` +
+          `text='${text}':` +
+          `fontcolor=white:` +
+          `fontsize=60:` +
+          `borderw=5:` +
+          `bordercolor=black:` +
+          `x=(w-text_w)/2:` +
+          `y=h-(text_h*3):` +
+          `enable='between(t,${start},${end})'`
         );
-
-      jobs.set(jobId, {
-        success: true,
-        jobId,
-        status: "processing",
-        progress,
-        message:
-          `Criando cena ${i + 1} de ${imagePaths.length}`
       });
 
-      const sceneVideo = path.join(
-        jobDir,
-        `scene-${String(i).padStart(3, "0")}.mp4`
-      );
-
-      const frames = Math.max(
-        1,
-        Math.round(sceneDuration * 30)
-      );
-
-      await runFFmpeg(
-        [
-          "-y",
-
-          "-loop", "1",
-
-          "-i", imagePaths[i],
-
-          "-vf",
-          `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(zoom+0.0012,1.08)':d=${frames}:s=1080x1920:fps=30,format=yuv420p`,
-
-          "-t", String(sceneDuration),
-
-          "-r", "30",
-
-          "-c:v", "libx264",
-
-          "-preset", "ultrafast",
-
-          "-crf", "28",
-
-          "-pix_fmt", "yuv420p",
-
-          sceneVideo
-        ],
-        `Cena ${i + 1}/${imagePaths.length}`
-      );
-
-      sceneVideos.push(sceneVideo);
-    }
-
-    /*
-      ETAPA 4 - JUNTAR CENAS
-    */
-    jobs.set(jobId, {
-      success: true,
-      jobId,
-      status: "processing",
-      progress: 80,
-      message: "Juntando cenas"
-    });
-
-    const concatFile =
-      path.join(jobDir, "concat.txt");
-
-    const concatContent =
-      sceneVideos
-        .map(video => `file '${video}'`)
-        .join("\n");
-
-    fs.writeFileSync(
-      concatFile,
-      concatContent
-    );
-
-    const videoWithoutAudio =
-      path.join(jobDir, "video.mp4");
-
-    await runFFmpeg(
-      [
+      await runFFmpeg([
         "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concatFile,
-        "-c", "copy",
-        videoWithoutAudio
-      ],
-      "Concatenacao"
-    );
+        "-i",
+        videoWithAudio,
 
-    /*
-      ETAPA 5 - ADICIONAR AUDIO
-    */
-    jobs.set(jobId, {
-      success: true,
-      jobId,
-      status: "processing",
-      progress: 90,
-      message: "Adicionando audio"
-    });
+        "-vf",
+        drawTextFilters.join(","),
 
-    const outputFilename =
-      `${jobId}.mp4`;
+        "-c:v",
+        "libx264",
 
-    const outputPath =
-      path.join(
-        OUTPUT_DIR,
-        outputFilename
-      );
+        "-preset",
+        "ultrafast",
 
-    await runFFmpeg(
-      [
-        "-y",
+        "-crf",
+        "27",
 
-        "-i", videoWithoutAudio,
+        "-c:a",
+        "copy",
 
-        "-i", audioPath,
-
-        "-c:v", "copy",
-
-        "-c:a", "aac",
-
-        "-b:a", "128k",
-
-        "-shortest",
-
-        "-movflags", "+faststart",
+        "-movflags",
+        "+faststart",
 
         outputPath
-      ],
-      "Video final"
-    );
+      ]);
+    } else {
+      fs.copyFileSync(videoWithAudio, outputPath);
+    }
 
-    const videoUrl =
-      `${baseUrl}/videos/${outputFilename}`;
+    job.status = "completed";
+    job.progress = 100;
+    job.message = "Video concluido";
 
-    /*
-      CONCLUIDO
-    */
-    jobs.set(jobId, {
-      success: true,
-      jobId,
-      status: "completed",
-      progress: 100,
-      message: "Video concluido",
-      videoUrl,
-      resolution: "1080x1920",
-      fps: 30,
-      format: "mp4",
-      duration
-    });
+    job.videoUrl =
+      `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` +
+      `/videos/${jobId}.mp4`;
 
-    console.log("");
-    console.log("=====================================");
-    console.log("VIDEO CONCLUIDO");
-    console.log(`JOB: ${jobId}`);
-    console.log(`URL: ${videoUrl}`);
-    console.log("=====================================");
+    job.resolution = "1080x1920";
+    job.fps = 30;
+    job.format = "mp4";
+    job.duration = duration;
+
+    console.log(`VIDEO CONCLUIDO: ${job.videoUrl}`);
 
   } catch (error) {
-    console.error("");
-    console.error("=====================================");
-    console.error("ERRO NA RENDERIZACAO");
-    console.error(`JOB: ${jobId}`);
-    console.error(error);
-    console.error("=====================================");
+    console.error("ERRO:", error);
 
-    jobs.set(jobId, {
-      success: false,
-      jobId,
-      status: "error",
-      progress: 0,
-      message: "Erro na renderizacao",
-      error: error.message
-    });
-
-  } finally {
-    setTimeout(() => {
-      fs.rm(
-        jobDir,
-        {
-          recursive: true,
-          force: true
-        },
-        () => {
-          console.log(
-            `Temporarios removidos: ${jobId}`
-          );
-        }
-      );
-    }, 300000);
+    job.status = "error";
+    job.progress = 0;
+    job.message = "Erro ao gerar video";
+    job.error = error.message;
   }
 }
 
-/*
-  CRIAR RENDERIZACAO
-  EXIGE API KEY
-*/
-app.post(
-  "/render",
-  requireApiKey,
-  (req, res) => {
-    const {
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    service: "Curioso AI Video API",
+    status: "online"
+  });
+});
+
+app.get("/health", async (req, res) => {
+  execFile("ffmpeg", ["-version"], error => {
+    res.json({
+      success: true,
+      status: "healthy",
+      ffmpeg: !error
+    });
+  });
+});
+
+app.post("/render", requireApiKey, async (req, res) => {
+  const {
+    images,
+    audioUrl,
+    duration,
+    captions
+  } = req.body;
+
+  if (!Array.isArray(images) || images.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: "Informe pelo menos uma imagem."
+    });
+  }
+
+  if (!audioUrl) {
+    return res.status(400).json({
+      success: false,
+      error: "audioUrl nao informado."
+    });
+  }
+
+  const jobId = crypto.randomUUID();
+
+  jobs.set(jobId, {
+    jobId,
+    status: "queued",
+    progress: 0,
+    message: "Renderizacao iniciada"
+  });
+
+  setImmediate(() => {
+    processVideo(jobId, {
       images,
       audioUrl,
-      duration = 60
-    } = req.body;
-
-    if (
-      !images ||
-      !Array.isArray(images) ||
-      images.length === 0
-    ) {
-      return res.status(400).json({
-        success: false,
-        error: "Nenhuma imagem recebida."
-      });
-    }
-
-    if (!audioUrl) {
-      return res.status(400).json({
-        success: false,
-        error: "audioUrl nao informado."
-      });
-    }
-
-    const jobId = crypto.randomUUID();
-
-    jobs.set(jobId, {
-      success: true,
-      jobId,
-      status: "queued",
-      progress: 0,
-      message: "Job recebido"
+      duration,
+      captions
     });
+  });
 
-    const protocol =
-      req.headers["x-forwarded-proto"] ||
-      req.protocol;
+  res.status(202).json({
+    success: true,
+    jobId,
+    status: "queued",
+    message: "Renderizacao iniciada",
+    statusUrl:
+      `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` +
+      `/status/${jobId}`
+  });
+});
 
-    const host = req.get("host");
+app.get("/status/:jobId", requireApiKey, (req, res) => {
+  const job = jobs.get(req.params.jobId);
 
-    const baseUrl =
-      `${protocol}://${host}`;
-
-    setImmediate(() => {
-      processVideo(
-        jobId,
-        {
-          images,
-          audioUrl,
-          duration
-        },
-        baseUrl
-      );
-    });
-
-    res.status(202).json({
-      success: true,
-      jobId,
-      status: "queued",
-      message: "Renderizacao iniciada",
-      statusUrl:
-        `${baseUrl}/status/${jobId}`
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      error: "Job nao encontrado."
     });
   }
-);
 
-/*
-  INICIAR SERVIDOR
-*/
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      `Curioso AI Video API segura rodando na porta ${PORT}`
-    );
-  }
-);
+  res.json({
+    success: true,
+    ...job
+  });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Curioso Video API rodando na porta ${PORT}`);
+});
