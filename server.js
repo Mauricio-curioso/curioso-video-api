@@ -19,14 +19,49 @@ fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 app.use("/videos", express.static(OUTPUT_DIR));
 
-/*
-  Jobs ficam em memoria nesta versao.
-  Para testes e suficiente.
-*/
 const jobs = new Map();
 
 /*
-  ROTA PRINCIPAL
+  SEGURANCA DA API
+*/
+function requireApiKey(req, res, next) {
+  const expectedKey = process.env.VIDEO_API_KEY;
+  const receivedKey = req.get("x-api-key");
+
+  if (!expectedKey) {
+    console.error("VIDEO_API_KEY nao configurada no servidor.");
+
+    return res.status(503).json({
+      success: false,
+      error: "API ainda nao configurada."
+    });
+  }
+
+  if (!receivedKey) {
+    return res.status(401).json({
+      success: false,
+      error: "API key nao informada."
+    });
+  }
+
+  const expectedBuffer = Buffer.from(expectedKey);
+  const receivedBuffer = Buffer.from(receivedKey);
+
+  if (
+    expectedBuffer.length !== receivedBuffer.length ||
+    !crypto.timingSafeEqual(expectedBuffer, receivedBuffer)
+  ) {
+    return res.status(401).json({
+      success: false,
+      error: "API key invalida."
+    });
+  }
+
+  next();
+}
+
+/*
+  PAGINA PRINCIPAL
 */
 app.get("/", (req, res) => {
   res.json({
@@ -34,6 +69,7 @@ app.get("/", (req, res) => {
     service: "Curioso AI Video API",
     status: "online",
     mode: "async",
+    security: "enabled",
     resolution: "1080x1920",
     fps: 30
   });
@@ -48,29 +84,35 @@ app.get("/health", (req, res) => {
     status: "healthy",
     ffmpeg: true,
     mode: "async",
+    security: "enabled",
     resolution: "1080x1920",
     fps: 30
   });
 });
 
 /*
-  CONSULTAR STATUS DO JOB
+  CONSULTAR STATUS
+  AGORA EXIGE API KEY
 */
-app.get("/status/:jobId", (req, res) => {
-  const job = jobs.get(req.params.jobId);
+app.get(
+  "/status/:jobId",
+  requireApiKey,
+  (req, res) => {
+    const job = jobs.get(req.params.jobId);
 
-  if (!job) {
-    return res.status(404).json({
-      success: false,
-      error: "Job nao encontrado."
-    });
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: "Job nao encontrado."
+      });
+    }
+
+    res.json(job);
   }
-
-  res.json(job);
-});
+);
 
 /*
-  BAIXAR ARQUIVO
+  DOWNLOAD DE ARQUIVOS
 */
 async function downloadFile(url, destination) {
   console.log(`Baixando: ${url}`);
@@ -360,7 +402,7 @@ async function processVideo(jobId, data, baseUrl) {
       `${baseUrl}/videos/${outputFilename}`;
 
     /*
-      JOB CONCLUIDO
+      CONCLUIDO
     */
     jobs.set(jobId, {
       success: true,
@@ -380,8 +422,6 @@ async function processVideo(jobId, data, baseUrl) {
     console.log("VIDEO CONCLUIDO");
     console.log(`JOB: ${jobId}`);
     console.log(`URL: ${videoUrl}`);
-    console.log("RESOLUCAO: 1080x1920");
-    console.log("FPS: 30");
     console.log("=====================================");
 
   } catch (error) {
@@ -420,79 +460,78 @@ async function processVideo(jobId, data, baseUrl) {
 }
 
 /*
-  RECEBER NOVA RENDERIZACAO
+  CRIAR RENDERIZACAO
+  EXIGE API KEY
 */
-app.post("/render", (req, res) => {
-  const {
-    images,
-    audioUrl,
-    duration = 60
-  } = req.body;
+app.post(
+  "/render",
+  requireApiKey,
+  (req, res) => {
+    const {
+      images,
+      audioUrl,
+      duration = 60
+    } = req.body;
 
-  if (
-    !images ||
-    !Array.isArray(images) ||
-    images.length === 0
-  ) {
-    return res.status(400).json({
-      success: false,
-      error: "Nenhuma imagem recebida."
-    });
-  }
+    if (
+      !images ||
+      !Array.isArray(images) ||
+      images.length === 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Nenhuma imagem recebida."
+      });
+    }
 
-  if (!audioUrl) {
-    return res.status(400).json({
-      success: false,
-      error: "audioUrl nao informado."
-    });
-  }
+    if (!audioUrl) {
+      return res.status(400).json({
+        success: false,
+        error: "audioUrl nao informado."
+      });
+    }
 
-  const jobId = crypto.randomUUID();
+    const jobId = crypto.randomUUID();
 
-  jobs.set(jobId, {
-    success: true,
-    jobId,
-    status: "queued",
-    progress: 0,
-    message: "Job recebido"
-  });
-
-  const protocol =
-    req.headers["x-forwarded-proto"] ||
-    req.protocol;
-
-  const host = req.get("host");
-
-  const baseUrl =
-    `${protocol}://${host}`;
-
-  /*
-    PROCESSA SEM BLOQUEAR A RESPOSTA
-  */
-  setImmediate(() => {
-    processVideo(
+    jobs.set(jobId, {
+      success: true,
       jobId,
-      {
-        images,
-        audioUrl,
-        duration
-      },
-      baseUrl
-    );
-  });
+      status: "queued",
+      progress: 0,
+      message: "Job recebido"
+    });
 
-  /*
-    DEVOLVE JOB ID IMEDIATAMENTE
-  */
-  res.status(202).json({
-    success: true,
-    jobId,
-    status: "queued",
-    message: "Renderizacao iniciada",
-    statusUrl:
-      `${baseUrl}/status/${jobId}`
-  });
-});
+    const protocol =
+      req.headers["x-forwarded-proto"] ||
+      req.protocol;
+
+    const host = req.get("host");
+
+    const baseUrl =
+      `${protocol}://${host}`;
+
+    setImmediate(() => {
+      processVideo(
+        jobId,
+        {
+          images,
+          audioUrl,
+          duration
+        },
+        baseUrl
+      );
+    });
+
+    res.status(202).json({
+      success: true,
+      jobId,
+      status: "queued",
+      message: "Renderizacao iniciada",
+      statusUrl:
+        `${baseUrl}/status/${jobId}`
+    });
+  }
+);
 
 /*
   INICIAR SERVIDOR
@@ -502,7 +541,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `Curioso AI Video API Full HD assincrona rodando na porta ${PORT}`
+      `Curioso AI Video API segura rodando na porta ${PORT}`
     );
   }
 );
