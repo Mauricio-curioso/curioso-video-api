@@ -4,15 +4,19 @@ const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
 const crypto = require("crypto");
+const { EdgeTTS } = require("node-edge-tts");
 
 const app = express();
-
 app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 10000;
 
 const OUTPUT_DIR = path.join(__dirname, "outputs");
 const TEMP_DIR = path.join(__dirname, "temp");
+
+const DEFAULT_LANGUAGE = "pt-BR";
+const DEFAULT_VOICE = "pt-BR-AntonioNeural";
+const DEFAULT_RATE = "-5%";
 
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -22,35 +26,64 @@ app.use("/videos", express.static(OUTPUT_DIR));
 const jobs = new Map();
 
 /* =========================================================
-   FFMPEG
+   FFMPEG / FFPROBE
 ========================================================= */
 
-function runFFmpeg(args) {
+function runCommand(command, args, maxBuffer = 20 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     execFile(
-      "ffmpeg",
+      command,
       args,
-      { maxBuffer: 20 * 1024 * 1024 },
+      { maxBuffer },
       (error, stdout, stderr) => {
         if (error) {
-          console.error("ERRO FFMPEG:");
-          console.error(stderr);
+          console.error(`ERRO ${command.toUpperCase()}:`);
+          console.error(stderr || error.message);
 
-          reject(
+          return reject(
             new Error(
               stderr ||
               error.message ||
-              "Erro desconhecido no FFmpeg"
+              `Erro em ${command}`
             )
           );
-
-          return;
         }
 
-        resolve();
+        resolve(stdout);
       }
     );
   });
+}
+
+async function getMediaDuration(filePath) {
+  const stdout = await runCommand(
+    "ffprobe",
+    [
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      filePath
+    ],
+    1024 * 1024
+  );
+
+  const duration = Number(
+    String(stdout).trim()
+  );
+
+  if (
+    !Number.isFinite(duration) ||
+    duration <= 0
+  ) {
+    throw new Error(
+      "Nao foi possivel obter a duracao do audio."
+    );
+  }
+
+  return duration;
 }
 
 /* =========================================================
@@ -58,8 +91,11 @@ function runFFmpeg(args) {
 ========================================================= */
 
 function requireApiKey(req, res, next) {
-  const expectedKey = process.env.VIDEO_API_KEY;
-  const receivedKey = req.get("x-api-key");
+  const expectedKey =
+    process.env.VIDEO_API_KEY;
+
+  const receivedKey =
+    req.get("x-api-key");
 
   if (!expectedKey) {
     return res.status(503).json({
@@ -75,11 +111,15 @@ function requireApiKey(req, res, next) {
     });
   }
 
-  const expectedBuffer = Buffer.from(expectedKey);
-  const receivedBuffer = Buffer.from(receivedKey);
+  const expectedBuffer =
+    Buffer.from(expectedKey);
+
+  const receivedBuffer =
+    Buffer.from(receivedKey);
 
   if (
-    expectedBuffer.length !== receivedBuffer.length ||
+    expectedBuffer.length !==
+      receivedBuffer.length ||
     !crypto.timingSafeEqual(
       expectedBuffer,
       receivedBuffer
@@ -98,50 +138,46 @@ function requireApiKey(req, res, next) {
    DOWNLOAD
 ========================================================= */
 
-async function downloadFile(url, destination) {
+async function downloadFile(
+  url,
+  destination
+) {
   const response = await axios({
     method: "GET",
     url,
     responseType: "stream",
     timeout: 120000,
-    maxRedirects: 5
+    maxRedirects: 5,
+    headers: {
+      "User-Agent":
+        "Curioso-AI-Studio/1.0"
+    }
   });
 
-  return new Promise((resolve, reject) => {
-    const writer = fs.createWriteStream(destination);
+  return new Promise(
+    (resolve, reject) => {
+      const writer =
+        fs.createWriteStream(
+          destination
+        );
 
-    response.data.pipe(writer);
+      response.data.pipe(writer);
 
-    writer.on("finish", resolve);
-    writer.on("error", reject);
-  });
-}
+      writer.on(
+        "finish",
+        resolve
+      );
 
-/* =========================================================
-   TEMPO DA LEGENDA ASS
-========================================================= */
-
-function assTime(seconds) {
-  const total = Math.max(
-    0,
-    Number(seconds) || 0
-  );
-
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const secs = Math.floor(total % 60);
-  const centiseconds = Math.floor((total % 1) * 100);
-
-  return (
-    `${hours}:` +
-    `${String(minutes).padStart(2, "0")}:` +
-    `${String(secs).padStart(2, "0")}.` +
-    `${String(centiseconds).padStart(2, "0")}`
+      writer.on(
+        "error",
+        reject
+      );
+    }
   );
 }
 
 /* =========================================================
-   LIMPA TEXTO
+   TEXTO
 ========================================================= */
 
 function cleanText(text) {
@@ -152,64 +188,116 @@ function cleanText(text) {
     .trim();
 }
 
-/* =========================================================
-   QUEBRA SEGURA DA LEGENDA
+function normalizeCaptionText(text) {
+  return cleanText(text)
+    .replace(
+      /\s+([,.!?;:])/g,
+      "$1"
+    )
+    .replace(
+      /([¿¡])\s+/g,
+      "$1"
+    );
+}
 
-   Limite menor para evitar corte lateral.
+/* =========================================================
+   TEMPO ASS
 ========================================================= */
 
-function wrapCaptionText(text, maxCharsPerLine = 16) {
-  const cleaned = cleanText(text);
+function assTime(seconds) {
+  const total = Math.max(
+    0,
+    Number(seconds) || 0
+  );
 
-  if (!cleaned) {
-    return "";
-  }
+  const hours =
+    Math.floor(total / 3600);
 
-  const words = cleaned.split(" ");
+  const minutes =
+    Math.floor(
+      (total % 3600) / 60
+    );
+
+  const secs =
+    Math.floor(total % 60);
+
+  const centiseconds =
+    Math.floor(
+      (total % 1) * 100
+    );
+
+  return (
+    `${hours}:` +
+    `${String(minutes).padStart(2, "0")}:` +
+    `${String(secs).padStart(2, "0")}.` +
+    `${String(centiseconds).padStart(2, "0")}`
+  );
+}
+
+/* =========================================================
+   QUEBRA DA LEGENDA
+========================================================= */
+
+function wrapCaptionText(
+  text,
+  maxCharsPerLine = 16
+) {
+  const words =
+    cleanText(text)
+      .split(" ")
+      .filter(Boolean);
 
   const lines = [];
-  let currentLine = "";
+  let line = "";
 
   for (const word of words) {
-    const candidate = currentLine
-      ? `${currentLine} ${word}`
-      : word;
+    const candidate =
+      line
+        ? `${line} ${word}`
+        : word;
 
-    if (candidate.length <= maxCharsPerLine) {
-      currentLine = candidate;
+    if (
+      candidate.length <=
+      maxCharsPerLine
+    ) {
+      line = candidate;
     } else {
-      if (currentLine) {
-        lines.push(currentLine);
+      if (line) {
+        lines.push(line);
       }
 
-      currentLine = word;
+      line = word;
     }
   }
 
-  if (currentLine) {
-    lines.push(currentLine);
+  if (line) {
+    lines.push(line);
   }
 
   return lines.join("\\N");
 }
 
-/* =========================================================
-   ESCAPE PARA ASS
-========================================================= */
-
 function escapeAssText(text) {
-  const wrapped = wrapCaptionText(text);
-
-  return wrapped
-    .replace(/{/g, "\\{")
-    .replace(/}/g, "\\}");
+  return wrapCaptionText(text)
+    .replace(
+      /{/g,
+      "\\{"
+    )
+    .replace(
+      /}/g,
+      "\\}"
+    );
 }
 
 /* =========================================================
-   CRIA ARQUIVO DE LEGENDA
+   ARQUIVO ASS
 ========================================================= */
 
-function createAssFile(captions, filePath, duration) {
+function createAssFile(
+  captions,
+  filePath,
+  duration
+) {
   let ass =
 `[Script Info]
 Title: Curioso AI Studio
@@ -228,28 +316,33 @@ Style: Curioso,DejaVu Sans,54,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 `;
 
-  captions.forEach((caption) => {
-    const start = assTime(
-      caption.start || 0
-    );
-
-    const end = assTime(
-      caption.end !== undefined
-        ? caption.end
-        : duration
-    );
-
-    const text = escapeAssText(
-      caption.text
-    );
+  for (
+    const caption of captions
+  ) {
+    const text =
+      escapeAssText(
+        caption.text
+      );
 
     if (!text) {
-      return;
+      continue;
     }
+
+    const start =
+      assTime(
+        caption.start || 0
+      );
+
+    const end =
+      assTime(
+        caption.end !== undefined
+          ? caption.end
+          : duration
+      );
 
     ass +=
       `Dialogue: 0,${start},${end},Curioso,,0,0,0,,${text}\n`;
-  });
+  }
 
   fs.writeFileSync(
     filePath,
@@ -259,292 +352,682 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 }
 
 /* =========================================================
-   PROCESSAMENTO DO VIDEO
+   EDGE TTS
 ========================================================= */
 
-async function processVideo(jobId, data) {
-  const job = jobs.get(jobId);
+function validateVoice(voice) {
+  const value =
+    String(
+      voice ||
+      DEFAULT_VOICE
+    ).trim();
 
-  const {
-    images,
-    audioUrl,
-    duration = 10,
-    captions = [],
-    language = "pt-BR"
-  } = data;
+  return value.startsWith(
+    "pt-BR-"
+  )
+    ? value
+    : DEFAULT_VOICE;
+}
 
-  const jobDir = path.join(
-    TEMP_DIR,
-    jobId
+function validateRate(rate) {
+  const value =
+    String(
+      rate ||
+      DEFAULT_RATE
+    ).trim();
+
+  if (
+    value === "default"
+  ) {
+    return value;
+  }
+
+  if (
+    /^[+-]\d{1,2}%$/.test(
+      value
+    )
+  ) {
+    return value;
+  }
+
+  return DEFAULT_RATE;
+}
+
+/* =========================================================
+   MONTA BLOCOS DE LEGENDA
+   A PARTIR DOS TEMPOS DAS PALAVRAS
+========================================================= */
+
+function buildCaptionsFromWordTimings(
+  wordTimings
+) {
+  const captions = [];
+
+  let parts = [];
+  let startMs = null;
+  let endMs = null;
+
+  function flush() {
+    if (
+      !parts.length ||
+      startMs === null ||
+      endMs === null
+    ) {
+      return;
+    }
+
+    const text =
+      normalizeCaptionText(
+        parts.join(" ")
+      );
+
+    if (text) {
+      captions.push({
+        text,
+
+        start: Number(
+          (
+            startMs / 1000
+          ).toFixed(3)
+        ),
+
+        end: Number(
+          (
+            endMs / 1000
+          ).toFixed(3)
+        )
+      });
+    }
+
+    parts = [];
+    startMs = null;
+    endMs = null;
+  }
+
+  for (
+    const cue of wordTimings
+  ) {
+    const part =
+      normalizeCaptionText(
+        cue?.part
+      );
+
+    const cueStart =
+      Number(
+        cue?.start
+      );
+
+    const cueEnd =
+      Number(
+        cue?.end
+      );
+
+    if (
+      !part ||
+      !Number.isFinite(
+        cueStart
+      ) ||
+      !Number.isFinite(
+        cueEnd
+      ) ||
+      cueEnd <= cueStart
+    ) {
+      continue;
+    }
+
+    const candidateText =
+      normalizeCaptionText(
+        [
+          ...parts,
+          part
+        ].join(" ")
+      );
+
+    const candidateStart =
+      startMs === null
+        ? cueStart
+        : startMs;
+
+    const candidateDuration =
+      (
+        cueEnd -
+        candidateStart
+      ) / 1000;
+
+    if (
+      parts.length > 0 &&
+      (
+        parts.length >= 5 ||
+        candidateText.length > 32 ||
+        candidateDuration > 2.6
+      )
+    ) {
+      flush();
+    }
+
+    if (
+      startMs === null
+    ) {
+      startMs =
+        cueStart;
+    }
+
+    parts.push(part);
+
+    endMs =
+      cueEnd;
+
+    if (
+      /[.!?…]$/.test(part) ||
+      (
+        /[,:;]$/.test(part) &&
+        parts.length >= 3
+      ) ||
+      parts.length >= 5
+    ) {
+      flush();
+    }
+  }
+
+  flush();
+
+  return captions;
+}
+
+/* =========================================================
+   GERAR NARRACAO EDGE TTS
+========================================================= */
+
+async function generateEdgeNarration({
+  text,
+  audioPath,
+  voice,
+  rate
+}) {
+  const narrationText =
+    cleanText(text);
+
+  if (!narrationText) {
+    throw new Error(
+      "Texto da narracao nao informado."
+    );
+  }
+
+  const selectedVoice =
+    validateVoice(
+      voice
+    );
+
+  const selectedRate =
+    validateRate(
+      rate
+    );
+
+  const tts =
+    new EdgeTTS({
+      voice:
+        selectedVoice,
+
+      lang:
+        DEFAULT_LANGUAGE,
+
+      outputFormat:
+        "audio-24khz-96kbitrate-mono-mp3",
+
+      saveSubtitles:
+        true,
+
+      pitch:
+        "default",
+
+      rate:
+        selectedRate,
+
+      volume:
+        "default",
+
+      timeout:
+        120000
+    });
+
+  await tts.ttsPromise(
+    narrationText,
+    audioPath
   );
+
+  if (
+    !fs.existsSync(
+      audioPath
+    ) ||
+    fs.statSync(
+      audioPath
+    ).size === 0
+  ) {
+    throw new Error(
+      "Edge TTS nao gerou o arquivo de audio."
+    );
+  }
+
+  const subtitlePath =
+    `${audioPath}.json`;
+
+  if (
+    !fs.existsSync(
+      subtitlePath
+    )
+  ) {
+    throw new Error(
+      "Edge TTS nao gerou os timestamps das legendas."
+    );
+  }
+
+  const wordTimings =
+    JSON.parse(
+      fs.readFileSync(
+        subtitlePath,
+        "utf8"
+      )
+    );
+
+  if (
+    !Array.isArray(
+      wordTimings
+    ) ||
+    wordTimings.length === 0
+  ) {
+    throw new Error(
+      "Edge TTS retornou timestamps vazios."
+    );
+  }
+
+  const duration =
+    await getMediaDuration(
+      audioPath
+    );
+
+  const captions =
+    buildCaptionsFromWordTimings(
+      wordTimings
+    );
+
+  return {
+    audioPath,
+    duration,
+    captions,
+    voice:
+      selectedVoice,
+    rate:
+      selectedRate
+  };
+}
+
+/* =========================================================
+   PROCESSAR VIDEO
+========================================================= */
+
+async function processVideo(
+  jobId,
+  data
+) {
+  const job =
+    jobs.get(jobId);
+
+  const jobDir =
+    path.join(
+      TEMP_DIR,
+      jobId
+    );
 
   fs.mkdirSync(
     jobDir,
-    { recursive: true }
+    {
+      recursive: true
+    }
   );
 
   try {
+    const {
+      images,
+      audioUrl,
+      text,
+      narrationText,
+      duration,
+      captions = [],
+      voice =
+        DEFAULT_VOICE,
+      rate =
+        DEFAULT_RATE
+    } = data;
 
     /* =====================================================
-       BAIXAR IMAGENS
+       IMAGENS
     ===================================================== */
 
-    job.status = "processing";
-    job.progress = 5;
-    job.message = "Baixando imagens";
+    job.status =
+      "processing";
+
+    job.progress =
+      5;
+
+    job.message =
+      "Baixando imagens";
 
     const imageFiles = [];
 
-    for (let i = 0; i < images.length; i++) {
-      const imagePath = path.join(
-        jobDir,
-        `image-${i}.jpg`
-      );
+    for (
+      let i = 0;
+      i < images.length;
+      i++
+    ) {
+      const imagePath =
+        path.join(
+          jobDir,
+          `image-${i}.jpg`
+        );
 
       await downloadFile(
         images[i],
         imagePath
       );
 
-      imageFiles.push(imagePath);
+      imageFiles.push(
+        imagePath
+      );
     }
 
     /* =====================================================
-       BAIXAR NARRACAO
+       AUDIO
     ===================================================== */
 
-    job.progress = 12;
-    job.message =
-      "Baixando narracao em portugues";
+    const audioPath =
+      path.join(
+        jobDir,
+        "narracao.mp3"
+      );
 
-    const audioPath = path.join(
-      jobDir,
-      "narracao.mp3"
-    );
+    const textToSpeak =
+      cleanText(
+        narrationText ||
+        text
+      );
 
-    await downloadFile(
-      audioUrl,
-      audioPath
-    );
+    let finalDuration;
+    let finalCaptions;
+    let finalVoice = null;
+    let narrationProvider;
+
+    job.progress =
+      12;
+
+    if (textToSpeak) {
+      job.message =
+        "Gerando narracao e legendas sincronizadas";
+
+      const ttsResult =
+        await generateEdgeNarration({
+          text:
+            textToSpeak,
+
+          audioPath,
+
+          voice,
+
+          rate
+        });
+
+      finalDuration =
+        ttsResult.duration;
+
+      finalCaptions =
+        ttsResult.captions;
+
+      finalVoice =
+        ttsResult.voice;
+
+      narrationProvider =
+        "edge-tts";
+
+      job.captionMode =
+        "automatic-word-timestamps";
+    } else {
+      if (!audioUrl) {
+        throw new Error(
+          "Informe text/narrationText ou audioUrl."
+        );
+      }
+
+      job.message =
+        "Baixando narracao em portugues";
+
+      await downloadFile(
+        audioUrl,
+        audioPath
+      );
+
+      const suppliedDuration =
+        Number(duration);
+
+      finalDuration =
+        Number.isFinite(
+          suppliedDuration
+        ) &&
+        suppliedDuration > 0
+          ? suppliedDuration
+          : await getMediaDuration(
+              audioPath
+            );
+
+      finalCaptions =
+        Array.isArray(
+          captions
+        )
+          ? captions
+          : [];
+
+      narrationProvider =
+        "external-audio";
+
+      job.captionMode =
+        finalCaptions.length
+          ? "provided"
+          : "none";
+    }
+
+    job.duration =
+      Number(
+        finalDuration.toFixed(3)
+      );
+
+    job.voice =
+      finalVoice;
+
+    job.narrationProvider =
+      narrationProvider;
+
+    job.captionCount =
+      finalCaptions.length;
 
     /* =====================================================
-       CRIAR CENAS
+       CENAS
     ===================================================== */
 
-    job.progress = 20;
-    job.message = "Criando cenas";
+    job.progress =
+      20;
+
+    job.message =
+      "Criando cenas";
 
     const sceneDuration =
-      duration / images.length;
+      finalDuration /
+      images.length;
 
     const sceneFiles = [];
 
-    for (let i = 0; i < imageFiles.length; i++) {
-      const scenePath = path.join(
-        jobDir,
-        `scene-${i}.mp4`
-      );
+    for (
+      let i = 0;
+      i < imageFiles.length;
+      i++
+    ) {
+      const scenePath =
+        path.join(
+          jobDir,
+          `scene-${i}.mp4`
+        );
 
       job.progress =
         20 +
         Math.round(
-          ((i + 1) / imageFiles.length) * 35
+          (
+            (i + 1) /
+            imageFiles.length
+          ) * 35
         );
 
       job.message =
         `Criando cena ${i + 1} de ${imageFiles.length}`;
 
-      await runFFmpeg([
-        "-y",
-
-        "-loop",
-        "1",
-
-        "-i",
-        imageFiles[i],
-
-        "-vf",
+      await runCommand(
+        "ffmpeg",
         [
-          "scale=1080:1920:force_original_aspect_ratio=increase",
-          "crop=1080:1920",
-          "zoompan=z='min(zoom+0.0005,1.06)':d=1:s=1080x1920:fps=30",
-          "format=yuv420p"
-        ].join(","),
+          "-y",
 
-        "-t",
-        String(sceneDuration),
+          "-loop",
+          "1",
 
-        "-r",
-        "30",
+          "-i",
+          imageFiles[i],
 
-        "-c:v",
-        "libx264",
+          "-vf",
+          [
+            "scale=1080:1920:force_original_aspect_ratio=increase",
+            "crop=1080:1920",
+            "zoompan=z='min(zoom+0.0005,1.06)':d=1:s=1080x1920:fps=30",
+            "format=yuv420p"
+          ].join(","),
 
-        "-preset",
-        "ultrafast",
+          "-t",
+          String(
+            sceneDuration
+          ),
 
-        "-crf",
-        "28",
+          "-r",
+          "30",
 
-        "-pix_fmt",
-        "yuv420p",
+          "-c:v",
+          "libx264",
 
+          "-preset",
+          "ultrafast",
+
+          "-crf",
+          "28",
+
+          "-pix_fmt",
+          "yuv420p",
+
+          scenePath
+        ]
+      );
+
+      sceneFiles.push(
         scenePath
-      ]);
-
-      sceneFiles.push(scenePath);
+      );
     }
 
     /* =====================================================
        JUNTAR CENAS
     ===================================================== */
 
-    job.progress = 60;
-    job.message = "Juntando cenas";
+    job.progress =
+      60;
 
-    const concatList = path.join(
-      jobDir,
-      "concat.txt"
-    );
+    job.message =
+      "Juntando cenas";
 
-    const concatContent = sceneFiles
-      .map((file) => `file '${file}'`)
-      .join("\n");
+    const concatList =
+      path.join(
+        jobDir,
+        "concat.txt"
+      );
 
     fs.writeFileSync(
       concatList,
-      concatContent,
+
+      sceneFiles
+        .map(
+          file =>
+            `file '${file}'`
+        )
+        .join("\n"),
+
       "utf8"
     );
 
-    const mergedVideo = path.join(
-      jobDir,
-      "merged.mp4"
+    const mergedVideo =
+      path.join(
+        jobDir,
+        "merged.mp4"
+      );
+
+    await runCommand(
+      "ffmpeg",
+      [
+        "-y",
+
+        "-f",
+        "concat",
+
+        "-safe",
+        "0",
+
+        "-i",
+        concatList,
+
+        "-c",
+        "copy",
+
+        mergedVideo
+      ]
     );
 
-    await runFFmpeg([
-      "-y",
-
-      "-f",
-      "concat",
-
-      "-safe",
-      "0",
-
-      "-i",
-      concatList,
-
-      "-c",
-      "copy",
-
-      mergedVideo
-    ]);
-
     /* =====================================================
-       ADICIONAR NARRACAO
+       AUDIO NO VIDEO
     ===================================================== */
 
-    job.progress = 70;
+    job.progress =
+      70;
 
     job.message =
       "Adicionando narracao pt-BR";
 
-    const videoWithAudio = path.join(
-      jobDir,
-      "video-audio.mp4"
-    );
-
-    await runFFmpeg([
-      "-y",
-
-      "-i",
-      mergedVideo,
-
-      "-i",
-      audioPath,
-
-      "-filter:a",
-      "loudnorm=I=-16:LRA=11:TP=-1.5",
-
-      "-map",
-      "0:v:0",
-
-      "-map",
-      "1:a:0",
-
-      "-c:v",
-      "copy",
-
-      "-c:a",
-      "aac",
-
-      "-b:a",
-      "192k",
-
-      "-ar",
-      "48000",
-
-      "-ac",
-      "2",
-
-      "-t",
-      String(duration),
-
-      "-movflags",
-      "+faststart",
-
-      videoWithAudio
-    ]);
-
-    /* =====================================================
-       ADICIONAR LEGENDAS
-    ===================================================== */
-
-    job.progress = 82;
-
-    job.message =
-      "Adicionando legendas em portugues";
-
-    const outputPath = path.join(
-      OUTPUT_DIR,
-      `${jobId}.mp4`
-    );
-
-    if (
-      Array.isArray(captions) &&
-      captions.length > 0
-    ) {
-      const assPath = path.join(
+    const videoWithAudio =
+      path.join(
         jobDir,
-        "legendas.ass"
+        "video-audio.mp4"
       );
 
-      createAssFile(
-        captions,
-        assPath,
-        duration
-      );
-
-      await runFFmpeg([
+    await runCommand(
+      "ffmpeg",
+      [
         "-y",
 
         "-i",
-        videoWithAudio,
+        mergedVideo,
 
-        "-vf",
-        `ass=${assPath}`,
+        "-i",
+        audioPath,
+
+        "-filter:a",
+        "loudnorm=I=-16:LRA=11:TP=-1.5",
+
+        "-map",
+        "0:v:0",
+
+        "-map",
+        "1:a:0",
 
         "-c:v",
-        "libx264",
-
-        "-preset",
-        "ultrafast",
-
-        "-crf",
-        "27",
-
-        "-pix_fmt",
-        "yuv420p",
+        "copy",
 
         "-c:a",
         "aac",
@@ -552,11 +1035,93 @@ async function processVideo(jobId, data) {
         "-b:a",
         "192k",
 
+        "-ar",
+        "48000",
+
+        "-ac",
+        "2",
+
+        "-t",
+        String(
+          finalDuration
+        ),
+
         "-movflags",
         "+faststart",
 
-        outputPath
-      ]);
+        videoWithAudio
+      ]
+    );
+
+    /* =====================================================
+       LEGENDAS
+    ===================================================== */
+
+    job.progress =
+      82;
+
+    job.message =
+      "Adicionando legendas sincronizadas";
+
+    const outputPath =
+      path.join(
+        OUTPUT_DIR,
+        `${jobId}.mp4`
+      );
+
+    if (
+      Array.isArray(
+        finalCaptions
+      ) &&
+      finalCaptions.length > 0
+    ) {
+      const assPath =
+        path.join(
+          jobDir,
+          "legendas.ass"
+        );
+
+      createAssFile(
+        finalCaptions,
+        assPath,
+        finalDuration
+      );
+
+      await runCommand(
+        "ffmpeg",
+        [
+          "-y",
+
+          "-i",
+          videoWithAudio,
+
+          "-vf",
+          `ass=${assPath}`,
+
+          "-c:v",
+          "libx264",
+
+          "-preset",
+          "ultrafast",
+
+          "-crf",
+          "27",
+
+          "-pix_fmt",
+          "yuv420p",
+
+          "-c:a",
+          "aac",
+
+          "-b:a",
+          "192k",
+
+          "-movflags",
+          "+faststart",
+
+          outputPath
+        ]
+      );
     } else {
       fs.copyFileSync(
         videoWithAudio,
@@ -565,11 +1130,14 @@ async function processVideo(jobId, data) {
     }
 
     /* =====================================================
-       FINALIZADO
+       FINAL
     ===================================================== */
 
-    job.status = "completed";
-    job.progress = 100;
+    job.status =
+      "completed";
+
+    job.progress =
+      100;
 
     job.message =
       "Video concluido";
@@ -581,74 +1149,280 @@ async function processVideo(jobId, data) {
     job.resolution =
       "1080x1920";
 
-    job.fps = 30;
-    job.format = "mp4";
-    job.duration = duration;
-    job.language = "pt-BR";
+    job.fps =
+      30;
+
+    job.format =
+      "mp4";
+
+    job.duration =
+      Number(
+        finalDuration.toFixed(3)
+      );
+
+    job.language =
+      DEFAULT_LANGUAGE;
+
+    job.voice =
+      finalVoice;
+
+    job.narrationProvider =
+      narrationProvider;
+
+    job.captionCount =
+      finalCaptions.length;
 
     console.log(
       `VIDEO CONCLUIDO: ${job.videoUrl}`
     );
 
   } catch (error) {
-
     console.error(
       "ERRO NO JOB:",
       error
     );
 
-    job.status = "error";
-    job.progress = 0;
+    job.status =
+      "error";
+
+    job.progress =
+      0;
 
     job.message =
       "Erro ao gerar video";
 
     job.error =
-      error.message;
+      error?.message ||
+      String(error);
   }
 }
+
+/* =========================================================
+   TESTE EDGE TTS
+========================================================= */
+
+app.post(
+  "/tts",
+  requireApiKey,
+  async (req, res) => {
+    try {
+      const {
+        text,
+
+        voice =
+          DEFAULT_VOICE,
+
+        rate =
+          DEFAULT_RATE,
+
+        language =
+          DEFAULT_LANGUAGE
+      } =
+        req.body || {};
+
+      if (
+        String(
+          language
+        ).toLowerCase() !==
+        "pt-br"
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+
+            error:
+              "Esta API esta configurada somente para portugues do Brasil (pt-BR)."
+          });
+      }
+
+      if (
+        !cleanText(text)
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              "Informe o campo text."
+          });
+      }
+
+      const ttsId =
+        crypto.randomUUID();
+
+      const ttsDir =
+        path.join(
+          TEMP_DIR,
+          `tts-${ttsId}`
+        );
+
+      fs.mkdirSync(
+        ttsDir,
+        {
+          recursive: true
+        }
+      );
+
+      const tempAudioPath =
+        path.join(
+          ttsDir,
+          "narracao.mp3"
+        );
+
+      const result =
+        await generateEdgeNarration({
+          text,
+          audioPath:
+            tempAudioPath,
+          voice,
+          rate
+        });
+
+      const publicAudioPath =
+        path.join(
+          OUTPUT_DIR,
+          `${ttsId}.mp3`
+        );
+
+      fs.copyFileSync(
+        tempAudioPath,
+        publicAudioPath
+      );
+
+      return res.json({
+        success: true,
+
+        provider:
+          "edge-tts",
+
+        language:
+          DEFAULT_LANGUAGE,
+
+        voice:
+          result.voice,
+
+        rate:
+          result.rate,
+
+        duration:
+          Number(
+            result.duration.toFixed(
+              3
+            )
+          ),
+
+        captions:
+          result.captions,
+
+        captionCount:
+          result.captions.length,
+
+        audioUrl:
+          `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` +
+          `/videos/${ttsId}.mp3`
+      });
+
+    } catch (error) {
+      console.error(
+        "ERRO EDGE TTS:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          success: false,
+
+          error:
+            error?.message ||
+            String(error)
+        });
+    }
+  }
+);
 
 /* =========================================================
    HOME
 ========================================================= */
 
-app.get("/", (req, res) => {
-  res.json({
-    success: true,
-    service:
-      "Curioso AI Video API",
-    status:
-      "online",
-    defaultLanguage:
-      "pt-BR",
-    resolution:
-      "1080x1920",
-    fps:
-      30
-  });
-});
+app.get(
+  "/",
+  (req, res) => {
+    res.json({
+      success: true,
+
+      service:
+        "Curioso AI Video API",
+
+      status:
+        "online",
+
+      defaultLanguage:
+        DEFAULT_LANGUAGE,
+
+      defaultVoice:
+        DEFAULT_VOICE,
+
+      narrationProvider:
+        "edge-tts",
+
+      automaticCaptions:
+        true,
+
+      resolution:
+        "1080x1920",
+
+      fps:
+        30
+    });
+  }
+);
 
 /* =========================================================
    HEALTH
 ========================================================= */
 
-app.get("/health", (req, res) => {
-  execFile(
-    "ffmpeg",
-    ["-version"],
-    (error) => {
-      res.json({
-        success: true,
-        status:
-          "healthy",
-        ffmpeg:
-          !error,
-        language:
-          "pt-BR"
-      });
-    }
-  );
-});
+app.get(
+  "/health",
+  (req, res) => {
+    execFile(
+      "ffmpeg",
+      ["-version"],
+      ffmpegError => {
+
+        execFile(
+          "ffprobe",
+          ["-version"],
+          ffprobeError => {
+
+            res.json({
+              success: true,
+
+              status:
+                "healthy",
+
+              ffmpeg:
+                !ffmpegError,
+
+              ffprobe:
+                !ffprobeError,
+
+              edgeTts:
+                true,
+
+              language:
+                DEFAULT_LANGUAGE,
+
+              defaultVoice:
+                DEFAULT_VOICE
+            });
+          }
+        );
+      }
+    );
+  }
+);
 
 /* =========================================================
    RENDER
@@ -662,53 +1436,96 @@ app.post(
     const {
       images,
       audioUrl,
+      text,
+      narrationText,
       duration,
       captions,
-      language = "pt-BR"
-    } = req.body;
+
+      language =
+        DEFAULT_LANGUAGE,
+
+      voice =
+        DEFAULT_VOICE,
+
+      rate =
+        DEFAULT_RATE
+    } =
+      req.body || {};
 
     if (
-      !Array.isArray(images) ||
+      !Array.isArray(
+        images
+      ) ||
       images.length === 0
     ) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Informe pelo menos uma imagem."
-      });
-    }
+      return res
+        .status(400)
+        .json({
+          success: false,
 
-    if (!audioUrl) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "audioUrl nao informado."
-      });
+          error:
+            "Informe pelo menos uma imagem."
+        });
     }
 
     if (
-      String(language).toLowerCase() !==
+      String(
+        language
+      ).toLowerCase() !==
       "pt-br"
     ) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Esta API esta configurada somente para portugues do Brasil (pt-BR)."
-      });
+      return res
+        .status(400)
+        .json({
+          success: false,
+
+          error:
+            "Esta API esta configurada somente para portugues do Brasil (pt-BR)."
+        });
     }
 
-    const videoDuration =
-      Number(duration);
+    const textToSpeak =
+      cleanText(
+        narrationText ||
+        text
+      );
 
     if (
-      !Number.isFinite(videoDuration) ||
-      videoDuration <= 0
+      !textToSpeak &&
+      !audioUrl
     ) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Informe uma duracao valida."
-      });
+      return res
+        .status(400)
+        .json({
+          success: false,
+
+          error:
+            "Informe text/narrationText para gerar a narracao automaticamente ou audioUrl para usar audio pronto."
+        });
+    }
+
+    if (
+      !textToSpeak &&
+      duration !== undefined
+    ) {
+      const value =
+        Number(duration);
+
+      if (
+        !Number.isFinite(
+          value
+        ) ||
+        value <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+
+            error:
+              "A duracao informada e invalida."
+          });
+      }
     }
 
     const jobId =
@@ -718,54 +1535,104 @@ app.post(
       jobId,
       {
         jobId,
+
         status:
           "queued",
+
         progress:
           0,
+
         message:
-          "Renderizacao iniciada",
+          textToSpeak
+            ? "Renderizacao iniciada com voz e legendas automaticas"
+            : "Renderizacao iniciada",
+
         language:
-          "pt-BR"
+          DEFAULT_LANGUAGE,
+
+        narrationProvider:
+          textToSpeak
+            ? "edge-tts"
+            : "external-audio",
+
+        voice:
+          textToSpeak
+            ? validateVoice(
+                voice
+              )
+            : null
       }
     );
 
-    setImmediate(() => {
-      processVideo(
+    setImmediate(
+      () => {
+        processVideo(
+          jobId,
+          {
+            images,
+            audioUrl,
+            text,
+            narrationText,
+            duration,
+
+            captions:
+              Array.isArray(
+                captions
+              )
+                ? captions
+                : [],
+
+            language:
+              DEFAULT_LANGUAGE,
+
+            voice,
+
+            rate
+          }
+        );
+      }
+    );
+
+    return res
+      .status(202)
+      .json({
+        success:
+          true,
+
         jobId,
-        {
-          images,
-          audioUrl,
-          duration:
-            videoDuration,
-          captions:
-            Array.isArray(captions)
-              ? captions
-              : [],
-          language:
-            "pt-BR"
-        }
-      );
-    });
 
-    res.status(202).json({
-      success:
-        true,
+        status:
+          "queued",
 
-      jobId,
+        language:
+          DEFAULT_LANGUAGE,
 
-      status:
-        "queued",
+        narrationProvider:
+          textToSpeak
+            ? "edge-tts"
+            : "external-audio",
 
-      language:
-        "pt-BR",
+        voice:
+          textToSpeak
+            ? validateVoice(
+                voice
+              )
+            : null,
 
-      message:
-        "Renderizacao iniciada",
+        automaticCaptions:
+          Boolean(
+            textToSpeak
+          ),
 
-      statusUrl:
-        `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` +
-        `/status/${jobId}`
-    });
+        message:
+          textToSpeak
+            ? "Renderizacao iniciada com voz e legendas automaticas"
+            : "Renderizacao iniciada",
+
+        statusUrl:
+          `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` +
+          `/status/${jobId}`
+      });
   }
 );
 
@@ -784,14 +1651,17 @@ app.get(
       );
 
     if (!job) {
-      return res.status(404).json({
-        success: false,
-        error:
-          "Job nao encontrado."
-      });
+      return res
+        .status(404)
+        .json({
+          success: false,
+
+          error:
+            "Job nao encontrado."
+        });
     }
 
-    res.json({
+    return res.json({
       success: true,
       ...job
     });
@@ -799,7 +1669,7 @@ app.get(
 );
 
 /* =========================================================
-   INICIAR SERVIDOR
+   SERVIDOR
 ========================================================= */
 
 app.listen(
@@ -812,7 +1682,11 @@ app.listen(
     );
 
     console.log(
-      "Idioma padrao: Portugues do Brasil (pt-BR)"
+      `Idioma padrao: ${DEFAULT_LANGUAGE}`
+    );
+
+    console.log(
+      `Voz padrao Edge TTS: ${DEFAULT_VOICE}`
     );
   }
 );
