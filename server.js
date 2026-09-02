@@ -13,122 +13,209 @@ const PORT = process.env.PORT || 10000;
 
 const OUTPUT_DIR = path.join(__dirname, "outputs");
 const TEMP_DIR = path.join(__dirname, "temp");
+const GENERATED_IMAGES_DIR = path.join(__dirname, "generated-images");
 
 const DEFAULT_LANGUAGE = "pt-BR";
 const DEFAULT_VOICE = "pt-BR-AntonioNeural";
 const DEFAULT_RATE = "-5%";
+const DEFAULT_IMAGE_MODEL = "flux";
 
-fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-fs.mkdirSync(TEMP_DIR, { recursive: true });
-
-app.use("/videos", express.static(OUTPUT_DIR));
-
-const jobs = new Map();
-
-/* =========================================================
-   FFMPEG / FFPROBE
-========================================================= */
-
-function runCommand(command, args, maxBuffer = 20 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    execFile(
-      command,
-      args,
-      { maxBuffer },
-      (error, stdout, stderr) => {
-        if (error) {
-          console.error(`ERRO ${command.toUpperCase()}:`);
-          console.error(stderr || error.message);
-
-          return reject(
-            new Error(
-              stderr ||
-              error.message ||
-              `Erro em ${command}`
-            )
-          );
-        }
-
-        resolve(stdout);
-      }
-    );
+for (const dir of [
+  OUTPUT_DIR,
+  TEMP_DIR,
+  GENERATED_IMAGES_DIR
+]) {
+  fs.mkdirSync(dir, {
+    recursive: true
   });
 }
 
-async function getMediaDuration(filePath) {
-  const stdout = await runCommand(
+app.use(
+  "/videos",
+  express.static(OUTPUT_DIR)
+);
+
+app.use(
+  "/generated-images",
+  express.static(GENERATED_IMAGES_DIR)
+);
+
+const jobs = new Map();
+const imageJobs = new Map();
+
+/* =========================================================
+   FUNCOES BASICAS
+========================================================= */
+
+function publicBaseUrl() {
+  return process.env.RENDER_EXTERNAL_HOSTNAME
+    ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`
+    : `http://localhost:${PORT}`;
+}
+
+function cleanText(text) {
+  return String(text || "")
+    .replace(/\r/g, " ")
+    .replace(/\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function safeUnlink(file) {
+  try {
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
+    }
+  } catch (_) {}
+}
+
+/* =========================================================
+   EXECUTAR COMANDOS
+========================================================= */
+
+function run(
+  command,
+  args,
+  maxBuffer = 20 * 1024 * 1024
+) {
+  return new Promise(
+    (resolve, reject) => {
+
+      execFile(
+        command,
+        args,
+        {
+          maxBuffer
+        },
+        (
+          error,
+          stdout,
+          stderr
+        ) => {
+
+          if (error) {
+            console.error(
+              `ERRO ${command.toUpperCase()}:`,
+              stderr || error.message
+            );
+
+            return reject(
+              new Error(
+                stderr ||
+                error.message ||
+                `Erro em ${command}`
+              )
+            );
+          }
+
+          resolve(stdout);
+        }
+      );
+    }
+  );
+}
+
+/* =========================================================
+   DURACAO AUDIO
+========================================================= */
+
+async function mediaDuration(
+  file
+) {
+
+  const out = await run(
     "ffprobe",
     [
       "-v",
       "error",
+
       "-show_entries",
       "format=duration",
+
       "-of",
       "default=noprint_wrappers=1:nokey=1",
-      filePath
+
+      file
     ],
     1024 * 1024
   );
 
-  const duration = Number(
-    String(stdout).trim()
-  );
+  const value =
+    Number(
+      String(out).trim()
+    );
 
   if (
-    !Number.isFinite(duration) ||
-    duration <= 0
+    !Number.isFinite(value) ||
+    value <= 0
   ) {
     throw new Error(
-      "Nao foi possivel obter a duracao do audio."
+      "Duracao de audio invalida."
     );
   }
 
-  return duration;
+  return value;
 }
 
 /* =========================================================
-   API KEY
+   SEGURANCA API
 ========================================================= */
 
-function requireApiKey(req, res, next) {
-  const expectedKey =
+function requireApiKey(
+  req,
+  res,
+  next
+) {
+
+  const expected =
     process.env.VIDEO_API_KEY;
 
-  const receivedKey =
+  const received =
     req.get("x-api-key");
 
-  if (!expectedKey) {
-    return res.status(503).json({
-      success: false,
-      error: "API ainda nao configurada."
-    });
+  if (!expected) {
+
+    return res
+      .status(503)
+      .json({
+        success: false,
+        error:
+          "API ainda nao configurada."
+      });
   }
 
-  if (!receivedKey) {
-    return res.status(401).json({
-      success: false,
-      error: "API key nao informada."
-    });
+  if (!received) {
+
+    return res
+      .status(401)
+      .json({
+        success: false,
+        error:
+          "API key nao informada."
+      });
   }
 
-  const expectedBuffer =
-    Buffer.from(expectedKey);
+  const a =
+    Buffer.from(expected);
 
-  const receivedBuffer =
-    Buffer.from(receivedKey);
+  const b =
+    Buffer.from(received);
 
   if (
-    expectedBuffer.length !==
-      receivedBuffer.length ||
+    a.length !== b.length ||
     !crypto.timingSafeEqual(
-      expectedBuffer,
-      receivedBuffer
+      a,
+      b
     )
   ) {
-    return res.status(401).json({
-      success: false,
-      error: "API key invalida."
-    });
+
+    return res
+      .status(401)
+      .json({
+        success: false,
+        error:
+          "API key invalida."
+      });
   }
 
   next();
@@ -142,26 +229,44 @@ async function downloadFile(
   url,
   destination
 ) {
-  const response = await axios({
-    method: "GET",
-    url,
-    responseType: "stream",
-    timeout: 120000,
-    maxRedirects: 5,
-    headers: {
-      "User-Agent":
-        "Curioso-AI-Studio/1.0"
-    }
-  });
 
-  return new Promise(
-    (resolve, reject) => {
+  const response =
+    await axios({
+
+      method:
+        "GET",
+
+      url,
+
+      responseType:
+        "stream",
+
+      timeout:
+        120000,
+
+      maxRedirects:
+        5,
+
+      headers: {
+        "User-Agent":
+          "Curioso-AI-Studio/1.0"
+      }
+    });
+
+  await new Promise(
+    (
+      resolve,
+      reject
+    ) => {
+
       const writer =
         fs.createWriteStream(
           destination
         );
 
-      response.data.pipe(writer);
+      response.data.pipe(
+        writer
+      );
 
       writer.on(
         "finish",
@@ -177,80 +282,570 @@ async function downloadFile(
 }
 
 /* =========================================================
-   TEXTO
+   IMAGEM - PROMPT FINAL
 ========================================================= */
 
-function cleanText(text) {
-  return String(text || "")
-    .replace(/\r/g, " ")
-    .replace(/\n/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+function finalImagePrompt(
+  scenePrompt,
+  style
+) {
 
-function normalizeCaptionText(text) {
-  return cleanText(text)
-    .replace(
-      /\s+([,.!?;:])/g,
-      "$1"
-    )
-    .replace(
-      /([¿¡])\s+/g,
-      "$1"
-    );
+  return cleanText(
+
+    `${scenePrompt}. ` +
+
+    `${
+      style ||
+      "cinematic documentary photography, realistic, dramatic lighting, investigative atmosphere, vertical 9:16 portrait composition"
+    }. ` +
+
+    "no text, no captions, no subtitles, no letters, no logo, no watermark, no frame, no collage, one single full-screen scene"
+  );
 }
 
 /* =========================================================
-   TEMPO ASS
+   GERAR 1 IMAGEM NO POLLINATIONS
 ========================================================= */
 
-function assTime(seconds) {
-  const total = Math.max(
-    0,
-    Number(seconds) || 0
-  );
+async function generatePollinationsImage({
+  prompt,
+  outputPath,
+  model = DEFAULT_IMAGE_MODEL,
+  seed,
+  enhance = true,
+  safe = true
+}) {
 
-  const hours =
-    Math.floor(total / 3600);
+  const key =
+    process.env
+      .POLLINATIONS_API_KEY;
 
-  const minutes =
-    Math.floor(
-      (total % 3600) / 60
+  if (!key) {
+
+    throw new Error(
+      "POLLINATIONS_API_KEY nao configurada no Render."
+    );
+  }
+
+  const normalizedPrompt =
+    cleanText(prompt)
+      .slice(
+        0,
+        1800
+      );
+
+  if (!normalizedPrompt) {
+
+    throw new Error(
+      "Prompt da imagem vazio."
+    );
+  }
+
+  const params =
+    new URLSearchParams({
+
+      model:
+        cleanText(model) ||
+        DEFAULT_IMAGE_MODEL,
+
+      width:
+        "1080",
+
+      height:
+        "1920",
+
+      nologo:
+        "true",
+
+      private:
+        "true",
+
+      enhance:
+        enhance
+          ? "true"
+          : "false",
+
+      safe:
+        safe
+          ? "true"
+          : "false"
+    });
+
+  if (
+    Number.isFinite(
+      Number(seed)
+    )
+  ) {
+
+    params.set(
+      "seed",
+      String(
+        Math.floor(
+          Number(seed)
+        )
+      )
+    );
+  }
+
+  const url =
+    `https://gen.pollinations.ai/image/` +
+    `${encodeURIComponent(
+      normalizedPrompt
+    )}?${params}`;
+
+  const source =
+    `${outputPath}.source`;
+
+  try {
+
+    const response =
+      await axios({
+
+        method:
+          "GET",
+
+        url,
+
+        responseType:
+          "arraybuffer",
+
+        timeout:
+          240000,
+
+        maxRedirects:
+          5,
+
+        maxContentLength:
+          Infinity,
+
+        maxBodyLength:
+          Infinity,
+
+        headers: {
+
+          Authorization:
+            `Bearer ${key}`,
+
+          Accept:
+            "image/*",
+
+          "User-Agent":
+            "Curioso-AI-Studio/1.0"
+        },
+
+        validateStatus:
+          () => true
+      });
+
+    if (
+      response.status < 200 ||
+      response.status >= 300
+    ) {
+
+      const detail =
+        Buffer
+          .from(
+            response.data
+          )
+          .toString("utf8")
+          .slice(
+            0,
+            1000
+          );
+
+      throw new Error(
+        `Pollinations HTTP ${response.status}` +
+        (
+          detail
+            ? `: ${detail}`
+            : ""
+        )
+      );
+    }
+
+    const contentType =
+      String(
+        response
+          .headers[
+            "content-type"
+          ] || ""
+      );
+
+    if (
+      !contentType
+        .startsWith(
+          "image/"
+        )
+    ) {
+
+      const detail =
+        Buffer
+          .from(
+            response.data
+          )
+          .toString("utf8")
+          .slice(
+            0,
+            1000
+          );
+
+      throw new Error(
+        `Pollinations nao retornou imagem (${contentType}). ${detail}`
+      );
+    }
+
+    fs.writeFileSync(
+      source,
+      Buffer.from(
+        response.data
+      )
     );
 
-  const secs =
-    Math.floor(total % 60);
+    /*
+      NORMALIZA PARA 1080x1920
+    */
 
-  const centiseconds =
+    await run(
+      "ffmpeg",
+      [
+        "-y",
+
+        "-i",
+        source,
+
+        "-vf",
+        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+
+        "-frames:v",
+        "1",
+
+        "-q:v",
+        "2",
+
+        outputPath
+      ]
+    );
+
+    if (
+      !fs.existsSync(
+        outputPath
+      ) ||
+      !fs
+        .statSync(
+          outputPath
+        )
+        .size
+    ) {
+
+      throw new Error(
+        "Imagem final nao foi criada."
+      );
+    }
+
+  } finally {
+
+    safeUnlink(
+      source
+    );
+  }
+}
+
+/* =========================================================
+   GERAR LOTE DE IMAGENS
+========================================================= */
+
+async function processImageBatch(
+  jobId,
+  {
+    scenes,
+    model,
+    style,
+    enhance,
+    safe
+  }
+) {
+
+  const job =
+    imageJobs.get(
+      jobId
+    );
+
+  try {
+
+    const dir =
+      path.join(
+        GENERATED_IMAGES_DIR,
+        jobId
+      );
+
+    fs.mkdirSync(
+      dir,
+      {
+        recursive: true
+      }
+    );
+
+    job.status =
+      "processing";
+
+    job.message =
+      `Preparando ${scenes.length} imagens`;
+
+    const results = [];
+
+    for (
+      let i = 0;
+      i < scenes.length;
+      i++
+    ) {
+
+      const scene =
+        scenes[i] || {};
+
+      const sceneNumber =
+        Number(
+          scene.sceneNumber
+        ) ||
+        i + 1;
+
+      const prompt =
+        cleanText(
+          scene.imagePrompt ||
+          scene.prompt
+        );
+
+      if (!prompt) {
+
+        throw new Error(
+          `Cena ${sceneNumber} sem imagePrompt.`
+        );
+      }
+
+      job.currentScene =
+        sceneNumber;
+
+      job.progress =
+        Math.max(
+          2,
+          Math.round(
+            (
+              i /
+              scenes.length
+            ) * 95
+          )
+        );
+
+      job.message =
+        `Gerando imagem ${i + 1} de ${scenes.length}`;
+
+      const fileName =
+        `scene-${String(
+          i + 1
+        ).padStart(
+          2,
+          "0"
+        )}.jpg`;
+
+      const outputPath =
+        path.join(
+          dir,
+          fileName
+        );
+
+      const seed =
+        Number.isFinite(
+          Number(
+            scene.seed
+          )
+        )
+
+          ? Number(
+              scene.seed
+            )
+
+          : crypto
+              .randomInt(
+                1,
+                2147483646
+              );
+
+      const builtPrompt =
+        finalImagePrompt(
+          prompt,
+          style
+        );
+
+      await generatePollinationsImage({
+        prompt:
+          builtPrompt,
+
+        outputPath,
+
+        model,
+
+        seed,
+
+        enhance,
+
+        safe
+      });
+
+      const item = {
+
+        sceneNumber,
+
+        title:
+          cleanText(
+            scene.title ||
+            `Cena ${sceneNumber}`
+          ),
+
+        imagePrompt:
+          prompt,
+
+        seed,
+
+        imageUrl:
+          `${publicBaseUrl()}` +
+          `/generated-images/` +
+          `${jobId}/` +
+          `${fileName}`
+      };
+
+      results.push(
+        item
+      );
+
+      job.images =
+        [
+          ...results
+        ];
+
+      job.generatedCount =
+        results.length;
+
+      job.progress =
+        Math.round(
+          (
+            (
+              i + 1
+            ) /
+            scenes.length
+          ) * 98
+        );
+    }
+
+    job.status =
+      "completed";
+
+    job.progress =
+      100;
+
+    job.message =
+      "Imagens geradas com sucesso";
+
+    job.images =
+      results;
+
+    job.imageUrls =
+      results.map(
+        x =>
+          x.imageUrl
+      );
+
+    job.generatedCount =
+      results.length;
+
+  } catch (error) {
+
+    console.error(
+      "ERRO IMAGENS:",
+      error
+    );
+
+    job.status =
+      "error";
+
+    job.progress =
+      0;
+
+    job.message =
+      "Erro ao gerar imagens";
+
+    job.error =
+      error?.message ||
+      String(error);
+  }
+}
+
+/* =========================================================
+   LEGENDAS - TEMPO ASS
+========================================================= */
+
+function assTime(
+  seconds
+) {
+
+  const total =
+    Math.max(
+      0,
+      Number(seconds) || 0
+    );
+
+  const h =
     Math.floor(
-      (total % 1) * 100
+      total / 3600
+    );
+
+  const m =
+    Math.floor(
+      (
+        total % 3600
+      ) / 60
+    );
+
+  const s =
+    Math.floor(
+      total % 60
+    );
+
+  const cs =
+    Math.floor(
+      (
+        total % 1
+      ) * 100
     );
 
   return (
-    `${hours}:` +
-    `${String(minutes).padStart(2, "0")}:` +
-    `${String(secs).padStart(2, "0")}.` +
-    `${String(centiseconds).padStart(2, "0")}`
+    `${h}:` +
+    `${String(m).padStart(2, "0")}:` +
+    `${String(s).padStart(2, "0")}.` +
+    `${String(cs).padStart(2, "0")}`
   );
 }
 
 /* =========================================================
-   QUEBRA DA LEGENDA
+   QUEBRAR LEGENDA
 ========================================================= */
 
 function wrapCaptionText(
   text,
-  maxCharsPerLine = 16
+  maxChars = 16
 ) {
+
   const words =
     cleanText(text)
       .split(" ")
       .filter(Boolean);
 
   const lines = [];
+
   let line = "";
 
-  for (const word of words) {
+  for (
+    const word of words
+  ) {
+
     const candidate =
       line
         ? `${line} ${word}`
@@ -258,39 +853,40 @@ function wrapCaptionText(
 
     if (
       candidate.length <=
-      maxCharsPerLine
+      maxChars
     ) {
-      line = candidate;
+
+      line =
+        candidate;
+
     } else {
+
       if (line) {
-        lines.push(line);
+
+        lines.push(
+          line
+        );
       }
 
-      line = word;
+      line =
+        word;
     }
   }
 
   if (line) {
-    lines.push(line);
+
+    lines.push(
+      line
+    );
   }
 
-  return lines.join("\\N");
-}
-
-function escapeAssText(text) {
-  return wrapCaptionText(text)
-    .replace(
-      /{/g,
-      "\\{"
-    )
-    .replace(
-      /}/g,
-      "\\}"
-    );
+  return lines.join(
+    "\\N"
+  );
 }
 
 /* =========================================================
-   ARQUIVO ASS
+   CRIAR ASS
 ========================================================= */
 
 function createAssFile(
@@ -298,6 +894,7 @@ function createAssFile(
   filePath,
   duration
 ) {
+
   let ass =
 `[Script Info]
 Title: Curioso AI Studio
@@ -317,31 +914,37 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 `;
 
   for (
-    const caption of captions
+    const c of captions
   ) {
+
     const text =
-      escapeAssText(
-        caption.text
-      );
+      wrapCaptionText(
+        c.text
+      )
+        .replace(
+          /{/g,
+          "\\{"
+        )
+        .replace(
+          /}/g,
+          "\\}"
+        );
 
     if (!text) {
       continue;
     }
 
-    const start =
-      assTime(
-        caption.start || 0
-      );
-
-    const end =
-      assTime(
-        caption.end !== undefined
-          ? caption.end
-          : duration
-      );
-
     ass +=
-      `Dialogue: 0,${start},${end},Curioso,,0,0,0,,${text}\n`;
+      `Dialogue: 0,` +
+      `${assTime(
+        c.start || 0
+      )},` +
+      `${assTime(
+        c.end ??
+        duration
+      )},` +
+      `Curioso,,0,0,0,,` +
+      `${text}\n`;
   }
 
   fs.writeFileSync(
@@ -355,98 +958,124 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
    EDGE TTS
 ========================================================= */
 
-function validateVoice(voice) {
-  const value =
+function validateVoice(
+  voice
+) {
+
+  const v =
     String(
       voice ||
       DEFAULT_VOICE
     ).trim();
 
-  return value.startsWith(
+  return v.startsWith(
     "pt-BR-"
   )
-    ? value
+    ? v
     : DEFAULT_VOICE;
 }
 
-function validateRate(rate) {
-  const value =
+function validateRate(
+  rate
+) {
+
+  const r =
     String(
       rate ||
       DEFAULT_RATE
     ).trim();
 
-  if (
-    value === "default"
-  ) {
-    return value;
-  }
-
-  if (
+  return (
+    r === "default" ||
     /^[+-]\d{1,2}%$/.test(
-      value
+      r
     )
-  ) {
-    return value;
-  }
+  )
+    ? r
+    : DEFAULT_RATE;
+}
 
-  return DEFAULT_RATE;
+function normalizeCaptionText(
+  text
+) {
+
+  return cleanText(text)
+
+    .replace(
+      /\s+([,.!?;:])/g,
+      "$1"
+    )
+
+    .replace(
+      /([¿¡])\s+/g,
+      "$1"
+    );
 }
 
 /* =========================================================
-   MONTA BLOCOS DE LEGENDA
-   A PARTIR DOS TEMPOS DAS PALAVRAS
+   TEMPOS AUTOMATICOS
 ========================================================= */
 
 function buildCaptionsFromWordTimings(
-  wordTimings
+  timings
 ) {
+
   const captions = [];
 
   let parts = [];
   let startMs = null;
   let endMs = null;
 
-  function flush() {
-    if (
-      !parts.length ||
-      startMs === null ||
-      endMs === null
-    ) {
-      return;
-    }
+  const flush =
+    () => {
 
-    const text =
-      normalizeCaptionText(
-        parts.join(" ")
-      );
+      if (
+        !parts.length ||
+        startMs === null ||
+        endMs === null
+      ) {
 
-    if (text) {
-      captions.push({
-        text,
+        return;
+      }
 
-        start: Number(
-          (
-            startMs / 1000
-          ).toFixed(3)
-        ),
+      const text =
+        normalizeCaptionText(
+          parts.join(" ")
+        );
 
-        end: Number(
-          (
-            endMs / 1000
-          ).toFixed(3)
-        )
-      });
-    }
+      if (text) {
 
-    parts = [];
-    startMs = null;
-    endMs = null;
-  }
+        captions.push({
+
+          text,
+
+          start:
+            Number(
+              (
+                startMs /
+                1000
+              ).toFixed(3)
+            ),
+
+          end:
+            Number(
+              (
+                endMs /
+                1000
+              ).toFixed(3)
+            )
+        });
+      }
+
+      parts = [];
+      startMs = null;
+      endMs = null;
+    };
 
   for (
-    const cue of wordTimings
+    const cue of timings
   ) {
+
     const part =
       normalizeCaptionText(
         cue?.part
@@ -472,10 +1101,11 @@ function buildCaptionsFromWordTimings(
       ) ||
       cueEnd <= cueStart
     ) {
+
       continue;
     }
 
-    const candidateText =
+    const candidate =
       normalizeCaptionText(
         [
           ...parts,
@@ -495,24 +1125,28 @@ function buildCaptionsFromWordTimings(
       ) / 1000;
 
     if (
-      parts.length > 0 &&
+      parts.length &&
       (
         parts.length >= 5 ||
-        candidateText.length > 32 ||
+        candidate.length > 32 ||
         candidateDuration > 2.6
       )
     ) {
+
       flush();
     }
 
     if (
       startMs === null
     ) {
+
       startMs =
         cueStart;
     }
 
-    parts.push(part);
+    parts.push(
+      part
+    );
 
     endMs =
       cueEnd;
@@ -525,6 +1159,7 @@ function buildCaptionsFromWordTimings(
       ) ||
       parts.length >= 5
     ) {
+
       flush();
     }
   }
@@ -535,7 +1170,7 @@ function buildCaptionsFromWordTimings(
 }
 
 /* =========================================================
-   GERAR NARRACAO EDGE TTS
+   GERAR NARRACAO
 ========================================================= */
 
 async function generateEdgeNarration({
@@ -544,10 +1179,12 @@ async function generateEdgeNarration({
   voice,
   rate
 }) {
-  const narrationText =
+
+  const narration =
     cleanText(text);
 
-  if (!narrationText) {
+  if (!narration) {
+
     throw new Error(
       "Texto da narracao nao informado."
     );
@@ -565,6 +1202,7 @@ async function generateEdgeNarration({
 
   const tts =
     new EdgeTTS({
+
       voice:
         selectedVoice,
 
@@ -591,7 +1229,7 @@ async function generateEdgeNarration({
     });
 
   await tts.ttsPromise(
-    narrationText,
+    narration,
     audioPath
   );
 
@@ -599,12 +1237,15 @@ async function generateEdgeNarration({
     !fs.existsSync(
       audioPath
     ) ||
-    fs.statSync(
-      audioPath
-    ).size === 0
+    !fs
+      .statSync(
+        audioPath
+      )
+      .size
   ) {
+
     throw new Error(
-      "Edge TTS nao gerou o arquivo de audio."
+      "Edge TTS nao gerou audio."
     );
   }
 
@@ -616,12 +1257,13 @@ async function generateEdgeNarration({
       subtitlePath
     )
   ) {
+
     throw new Error(
-      "Edge TTS nao gerou os timestamps das legendas."
+      "Edge TTS nao gerou timestamps."
     );
   }
 
-  const wordTimings =
+  const timings =
     JSON.parse(
       fs.readFileSync(
         subtitlePath,
@@ -631,31 +1273,31 @@ async function generateEdgeNarration({
 
   if (
     !Array.isArray(
-      wordTimings
+      timings
     ) ||
-    wordTimings.length === 0
+    !timings.length
   ) {
+
     throw new Error(
-      "Edge TTS retornou timestamps vazios."
+      "Timestamps do Edge TTS vazios."
     );
   }
 
-  const duration =
-    await getMediaDuration(
-      audioPath
-    );
-
-  const captions =
-    buildCaptionsFromWordTimings(
-      wordTimings
-    );
-
   return {
-    audioPath,
-    duration,
-    captions,
+
+    duration:
+      await mediaDuration(
+        audioPath
+      ),
+
+    captions:
+      buildCaptionsFromWordTimings(
+        timings
+      ),
+
     voice:
       selectedVoice,
+
     rate:
       selectedRate
   };
@@ -669,8 +1311,11 @@ async function processVideo(
   jobId,
   data
 ) {
+
   const job =
-    jobs.get(jobId);
+    jobs.get(
+      jobId
+    );
 
   const jobDir =
     path.join(
@@ -686,6 +1331,7 @@ async function processVideo(
   );
 
   try {
+
     const {
       images,
       audioUrl,
@@ -693,15 +1339,9 @@ async function processVideo(
       narrationText,
       duration,
       captions = [],
-      voice =
-        DEFAULT_VOICE,
-      rate =
-        DEFAULT_RATE
+      voice = DEFAULT_VOICE,
+      rate = DEFAULT_RATE
     } = data;
-
-    /* =====================================================
-       IMAGENS
-    ===================================================== */
 
     job.status =
       "processing";
@@ -719,7 +1359,8 @@ async function processVideo(
       i < images.length;
       i++
     ) {
-      const imagePath =
+
+      const file =
         path.join(
           jobDir,
           `image-${i}.jpg`
@@ -727,17 +1368,13 @@ async function processVideo(
 
       await downloadFile(
         images[i],
-        imagePath
+        file
       );
 
       imageFiles.push(
-        imagePath
+        file
       );
     }
-
-    /* =====================================================
-       AUDIO
-    ===================================================== */
 
     const audioPath =
       path.join(
@@ -760,11 +1397,13 @@ async function processVideo(
       12;
 
     if (textToSpeak) {
+
       job.message =
         "Gerando narracao e legendas sincronizadas";
 
-      const ttsResult =
+      const tts =
         await generateEdgeNarration({
+
           text:
             textToSpeak,
 
@@ -776,21 +1415,24 @@ async function processVideo(
         });
 
       finalDuration =
-        ttsResult.duration;
+        tts.duration;
 
       finalCaptions =
-        ttsResult.captions;
+        tts.captions;
 
       finalVoice =
-        ttsResult.voice;
+        tts.voice;
 
       narrationProvider =
         "edge-tts";
 
       job.captionMode =
         "automatic-word-timestamps";
+
     } else {
+
       if (!audioUrl) {
+
         throw new Error(
           "Informe text/narrationText ou audioUrl."
         );
@@ -804,16 +1446,20 @@ async function processVideo(
         audioPath
       );
 
-      const suppliedDuration =
-        Number(duration);
+      const supplied =
+        Number(
+          duration
+        );
 
       finalDuration =
         Number.isFinite(
-          suppliedDuration
+          supplied
         ) &&
-        suppliedDuration > 0
-          ? suppliedDuration
-          : await getMediaDuration(
+        supplied > 0
+
+          ? supplied
+
+          : await mediaDuration(
               audioPath
             );
 
@@ -835,27 +1481,18 @@ async function processVideo(
 
     job.duration =
       Number(
-        finalDuration.toFixed(3)
+        finalDuration
+          .toFixed(3)
       );
-
-    job.voice =
-      finalVoice;
-
-    job.narrationProvider =
-      narrationProvider;
 
     job.captionCount =
       finalCaptions.length;
 
-    /* =====================================================
-       CENAS
-    ===================================================== */
+    job.narrationProvider =
+      narrationProvider;
 
-    job.progress =
-      20;
-
-    job.message =
-      "Criando cenas";
+    job.voice =
+      finalVoice;
 
     const sceneDuration =
       finalDuration /
@@ -868,7 +1505,8 @@ async function processVideo(
       i < imageFiles.length;
       i++
     ) {
-      const scenePath =
+
+      const scene =
         path.join(
           jobDir,
           `scene-${i}.mp4`
@@ -878,7 +1516,9 @@ async function processVideo(
         20 +
         Math.round(
           (
-            (i + 1) /
+            (
+              i + 1
+            ) /
             imageFiles.length
           ) * 35
         );
@@ -886,7 +1526,7 @@ async function processVideo(
       job.message =
         `Criando cena ${i + 1} de ${imageFiles.length}`;
 
-      await runCommand(
+      await run(
         "ffmpeg",
         [
           "-y",
@@ -898,12 +1538,7 @@ async function processVideo(
           imageFiles[i],
 
           "-vf",
-          [
-            "scale=1080:1920:force_original_aspect_ratio=increase",
-            "crop=1080:1920",
-            "zoompan=z='min(zoom+0.0005,1.06)':d=1:s=1080x1920:fps=30",
-            "format=yuv420p"
-          ].join(","),
+          "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(zoom+0.0005,1.06)':d=1:s=1080x1920:fps=30,format=yuv420p",
 
           "-t",
           String(
@@ -925,18 +1560,14 @@ async function processVideo(
           "-pix_fmt",
           "yuv420p",
 
-          scenePath
+          scene
         ]
       );
 
       sceneFiles.push(
-        scenePath
+        scene
       );
     }
-
-    /* =====================================================
-       JUNTAR CENAS
-    ===================================================== */
 
     job.progress =
       60;
@@ -944,32 +1575,33 @@ async function processVideo(
     job.message =
       "Juntando cenas";
 
-    const concatList =
+    const concat =
       path.join(
         jobDir,
         "concat.txt"
       );
 
     fs.writeFileSync(
-      concatList,
+
+      concat,
 
       sceneFiles
         .map(
-          file =>
-            `file '${file}'`
+          f =>
+            `file '${f}'`
         )
         .join("\n"),
 
       "utf8"
     );
 
-    const mergedVideo =
+    const merged =
       path.join(
         jobDir,
         "merged.mp4"
       );
 
-    await runCommand(
+    await run(
       "ffmpeg",
       [
         "-y",
@@ -981,18 +1613,14 @@ async function processVideo(
         "0",
 
         "-i",
-        concatList,
+        concat,
 
         "-c",
         "copy",
 
-        mergedVideo
+        merged
       ]
     );
-
-    /* =====================================================
-       AUDIO NO VIDEO
-    ===================================================== */
 
     job.progress =
       70;
@@ -1000,19 +1628,19 @@ async function processVideo(
     job.message =
       "Adicionando narracao pt-BR";
 
-    const videoWithAudio =
+    const withAudio =
       path.join(
         jobDir,
         "video-audio.mp4"
       );
 
-    await runCommand(
+    await run(
       "ffmpeg",
       [
         "-y",
 
         "-i",
-        mergedVideo,
+        merged,
 
         "-i",
         audioPath,
@@ -1049,13 +1677,9 @@ async function processVideo(
         "-movflags",
         "+faststart",
 
-        videoWithAudio
+        withAudio
       ]
     );
-
-    /* =====================================================
-       LEGENDAS
-    ===================================================== */
 
     job.progress =
       82;
@@ -1063,19 +1687,17 @@ async function processVideo(
     job.message =
       "Adicionando legendas sincronizadas";
 
-    const outputPath =
+    const output =
       path.join(
         OUTPUT_DIR,
         `${jobId}.mp4`
       );
 
     if (
-      Array.isArray(
-        finalCaptions
-      ) &&
-      finalCaptions.length > 0
+      finalCaptions.length
     ) {
-      const assPath =
+
+      const ass =
         path.join(
           jobDir,
           "legendas.ass"
@@ -1083,20 +1705,20 @@ async function processVideo(
 
       createAssFile(
         finalCaptions,
-        assPath,
+        ass,
         finalDuration
       );
 
-      await runCommand(
+      await run(
         "ffmpeg",
         [
           "-y",
 
           "-i",
-          videoWithAudio,
+          withAudio,
 
           "-vf",
-          `ass=${assPath}`,
+          `ass=${ass}`,
 
           "-c:v",
           "libx264",
@@ -1119,94 +1741,344 @@ async function processVideo(
           "-movflags",
           "+faststart",
 
-          outputPath
+          output
         ]
       );
+
     } else {
+
       fs.copyFileSync(
-        videoWithAudio,
-        outputPath
+        withAudio,
+        output
       );
     }
 
-    /* =====================================================
-       FINAL
-    ===================================================== */
+    Object.assign(
+      job,
+      {
 
-    job.status =
-      "completed";
+        status:
+          "completed",
 
-    job.progress =
-      100;
+        progress:
+          100,
 
-    job.message =
-      "Video concluido";
+        message:
+          "Video concluido",
 
-    job.videoUrl =
-      `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` +
-      `/videos/${jobId}.mp4`;
+        videoUrl:
+          `${publicBaseUrl()}/videos/${jobId}.mp4`,
 
-    job.resolution =
-      "1080x1920";
+        resolution:
+          "1080x1920",
 
-    job.fps =
-      30;
+        fps:
+          30,
 
-    job.format =
-      "mp4";
+        format:
+          "mp4",
 
-    job.duration =
-      Number(
-        finalDuration.toFixed(3)
-      );
+        duration:
+          Number(
+            finalDuration
+              .toFixed(3)
+          ),
 
-    job.language =
-      DEFAULT_LANGUAGE;
+        language:
+          DEFAULT_LANGUAGE,
 
-    job.voice =
-      finalVoice;
+        voice:
+          finalVoice,
 
-    job.narrationProvider =
-      narrationProvider;
+        narrationProvider,
 
-    job.captionCount =
-      finalCaptions.length;
-
-    console.log(
-      `VIDEO CONCLUIDO: ${job.videoUrl}`
+        captionCount:
+          finalCaptions.length
+      }
     );
 
   } catch (error) {
+
     console.error(
-      "ERRO NO JOB:",
+      "ERRO VIDEO:",
       error
     );
 
-    job.status =
-      "error";
+    Object.assign(
+      job,
+      {
 
-    job.progress =
-      0;
+        status:
+          "error",
 
-    job.message =
-      "Erro ao gerar video";
+        progress:
+          0,
 
-    job.error =
-      error?.message ||
-      String(error);
+        message:
+          "Erro ao gerar video",
+
+        error:
+          error?.message ||
+          String(error)
+      }
+    );
   }
 }
 
 /* =========================================================
-   TESTE EDGE TTS
+   POST GERAR IMAGENS
+========================================================= */
+
+app.post(
+  "/generate-images",
+  requireApiKey,
+  (
+    req,
+    res
+  ) => {
+
+    const {
+
+      scenes,
+
+      model =
+        DEFAULT_IMAGE_MODEL,
+
+      style,
+
+      enhance =
+        true,
+
+      safe =
+        true
+
+    } =
+      req.body || {};
+
+    if (
+      !process.env
+        .POLLINATIONS_API_KEY
+    ) {
+
+      return res
+        .status(503)
+        .json({
+
+          success:
+            false,
+
+          error:
+            "POLLINATIONS_API_KEY nao configurada no Render."
+        });
+    }
+
+    if (
+      !Array.isArray(
+        scenes
+      ) ||
+      !scenes.length
+    ) {
+
+      return res
+        .status(400)
+        .json({
+
+          success:
+            false,
+
+          error:
+            "Informe scenes com pelo menos uma cena."
+        });
+    }
+
+    if (
+      scenes.length > 20
+    ) {
+
+      return res
+        .status(400)
+        .json({
+
+          success:
+            false,
+
+          error:
+            "Limite atual: 20 imagens por lote."
+        });
+    }
+
+    for (
+      let i = 0;
+      i < scenes.length;
+      i++
+    ) {
+
+      if (
+        !cleanText(
+          scenes[i]
+            ?.imagePrompt ||
+          scenes[i]
+            ?.prompt
+        )
+      ) {
+
+        return res
+          .status(400)
+          .json({
+
+            success:
+              false,
+
+            error:
+              `Cena ${i + 1} sem imagePrompt.`
+          });
+      }
+    }
+
+    const jobId =
+      crypto.randomUUID();
+
+    imageJobs.set(
+      jobId,
+      {
+
+        jobId,
+
+        status:
+          "queued",
+
+        progress:
+          0,
+
+        message:
+          "Geracao de imagens iniciada",
+
+        totalImages:
+          scenes.length,
+
+        generatedCount:
+          0,
+
+        currentScene:
+          null,
+
+        model,
+
+        resolution:
+          "1080x1920",
+
+        aspectRatio:
+          "9:16",
+
+        images:
+          []
+      }
+    );
+
+    setImmediate(
+      () =>
+        processImageBatch(
+          jobId,
+          {
+            scenes,
+            model,
+            style,
+
+            enhance:
+              Boolean(
+                enhance
+              ),
+
+            safe:
+              Boolean(
+                safe
+              )
+          }
+        )
+    );
+
+    res
+      .status(202)
+      .json({
+
+        success:
+          true,
+
+        jobId,
+
+        status:
+          "queued",
+
+        totalImages:
+          scenes.length,
+
+        model,
+
+        message:
+          "Geracao de imagens iniciada",
+
+        statusUrl:
+          `${publicBaseUrl()}/image-status/${jobId}`
+      });
+  }
+);
+
+/* =========================================================
+   STATUS IMAGENS
+========================================================= */
+
+app.get(
+  "/image-status/:jobId",
+  requireApiKey,
+  (
+    req,
+    res
+  ) => {
+
+    const job =
+      imageJobs.get(
+        req.params.jobId
+      );
+
+    if (!job) {
+
+      return res
+        .status(404)
+        .json({
+
+          success:
+            false,
+
+          error:
+            "Job de imagens nao encontrado."
+        });
+    }
+
+    res.json({
+      success:
+        true,
+
+      ...job
+    });
+  }
+);
+
+/* =========================================================
+   TESTE TTS
 ========================================================= */
 
 app.post(
   "/tts",
   requireApiKey,
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
+
     try {
+
       const {
+
         text,
 
         voice =
@@ -1217,6 +2089,7 @@ app.post(
 
         language =
           DEFAULT_LANGUAGE
+
       } =
         req.body || {};
 
@@ -1226,72 +2099,85 @@ app.post(
         ).toLowerCase() !==
         "pt-br"
       ) {
+
         return res
           .status(400)
           .json({
-            success: false,
+
+            success:
+              false,
 
             error:
-              "Esta API esta configurada somente para portugues do Brasil (pt-BR)."
+              "Somente pt-BR."
           });
       }
 
       if (
         !cleanText(text)
       ) {
+
         return res
           .status(400)
           .json({
-            success: false,
+
+            success:
+              false,
+
             error:
-              "Informe o campo text."
+              "Informe text."
           });
       }
 
-      const ttsId =
+      const id =
         crypto.randomUUID();
 
-      const ttsDir =
+      const dir =
         path.join(
           TEMP_DIR,
-          `tts-${ttsId}`
+          `tts-${id}`
         );
 
       fs.mkdirSync(
-        ttsDir,
+        dir,
         {
           recursive: true
         }
       );
 
-      const tempAudioPath =
+      const tempAudio =
         path.join(
-          ttsDir,
+          dir,
           "narracao.mp3"
         );
 
       const result =
         await generateEdgeNarration({
+
           text,
+
           audioPath:
-            tempAudioPath,
+            tempAudio,
+
           voice,
+
           rate
         });
 
-      const publicAudioPath =
+      const publicAudio =
         path.join(
           OUTPUT_DIR,
-          `${ttsId}.mp3`
+          `${id}.mp3`
         );
 
       fs.copyFileSync(
-        tempAudioPath,
-        publicAudioPath
+        tempAudio,
+        publicAudio
       );
 
-      return res.json({
-        success: true,
+      res.json({
+
+        success:
+          true,
 
         provider:
           "edge-tts",
@@ -1307,32 +2193,30 @@ app.post(
 
         duration:
           Number(
-            result.duration.toFixed(
-              3
-            )
+            result.duration
+              .toFixed(3)
           ),
 
         captions:
           result.captions,
 
         captionCount:
-          result.captions.length,
+          result
+            .captions
+            .length,
 
         audioUrl:
-          `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` +
-          `/videos/${ttsId}.mp3`
+          `${publicBaseUrl()}/videos/${id}.mp3`
       });
 
     } catch (error) {
-      console.error(
-        "ERRO EDGE TTS:",
-        error
-      );
 
-      return res
+      res
         .status(500)
         .json({
-          success: false,
+
+          success:
+            false,
 
           error:
             error?.message ||
@@ -1343,102 +2227,29 @@ app.post(
 );
 
 /* =========================================================
-   HOME
-========================================================= */
-
-app.get(
-  "/",
-  (req, res) => {
-    res.json({
-      success: true,
-
-      service:
-        "Curioso AI Video API",
-
-      status:
-        "online",
-
-      defaultLanguage:
-        DEFAULT_LANGUAGE,
-
-      defaultVoice:
-        DEFAULT_VOICE,
-
-      narrationProvider:
-        "edge-tts",
-
-      automaticCaptions:
-        true,
-
-      resolution:
-        "1080x1920",
-
-      fps:
-        30
-    });
-  }
-);
-
-/* =========================================================
-   HEALTH
-========================================================= */
-
-app.get(
-  "/health",
-  (req, res) => {
-    execFile(
-      "ffmpeg",
-      ["-version"],
-      ffmpegError => {
-
-        execFile(
-          "ffprobe",
-          ["-version"],
-          ffprobeError => {
-
-            res.json({
-              success: true,
-
-              status:
-                "healthy",
-
-              ffmpeg:
-                !ffmpegError,
-
-              ffprobe:
-                !ffprobeError,
-
-              edgeTts:
-                true,
-
-              language:
-                DEFAULT_LANGUAGE,
-
-              defaultVoice:
-                DEFAULT_VOICE
-            });
-          }
-        );
-      }
-    );
-  }
-);
-
-/* =========================================================
-   RENDER
+   RENDER VIDEO
 ========================================================= */
 
 app.post(
   "/render",
   requireApiKey,
-  async (req, res) => {
+  (
+    req,
+    res
+  ) => {
 
     const {
+
       images,
+
       audioUrl,
+
       text,
+
       narrationText,
+
       duration,
+
       captions,
 
       language =
@@ -1449,6 +2260,7 @@ app.post(
 
       rate =
         DEFAULT_RATE
+
     } =
       req.body || {};
 
@@ -1456,12 +2268,15 @@ app.post(
       !Array.isArray(
         images
       ) ||
-      images.length === 0
+      !images.length
     ) {
+
       return res
         .status(400)
         .json({
-          success: false,
+
+          success:
+            false,
 
           error:
             "Informe pelo menos uma imagem."
@@ -1474,13 +2289,16 @@ app.post(
       ).toLowerCase() !==
       "pt-br"
     ) {
+
       return res
         .status(400)
         .json({
-          success: false,
+
+          success:
+            false,
 
           error:
-            "Esta API esta configurada somente para portugues do Brasil (pt-BR)."
+            "Somente pt-BR."
         });
     }
 
@@ -1494,38 +2312,40 @@ app.post(
       !textToSpeak &&
       !audioUrl
     ) {
+
       return res
         .status(400)
         .json({
-          success: false,
+
+          success:
+            false,
 
           error:
-            "Informe text/narrationText para gerar a narracao automaticamente ou audioUrl para usar audio pronto."
+            "Informe text/narrationText ou audioUrl."
         });
     }
 
     if (
       !textToSpeak &&
-      duration !== undefined
-    ) {
-      const value =
-        Number(duration);
-
-      if (
+      duration !== undefined &&
+      (
         !Number.isFinite(
-          value
+          Number(duration)
         ) ||
-        value <= 0
-      ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
+        Number(duration) <= 0
+      )
+    ) {
 
-            error:
-              "A duracao informada e invalida."
-          });
-      }
+      return res
+        .status(400)
+        .json({
+
+          success:
+            false,
+
+          error:
+            "Duracao invalida."
+        });
     }
 
     const jobId =
@@ -1534,6 +2354,7 @@ app.post(
     jobs.set(
       jobId,
       {
+
         jobId,
 
         status:
@@ -1544,7 +2365,9 @@ app.post(
 
         message:
           textToSpeak
+
             ? "Renderizacao iniciada com voz e legendas automaticas"
+
             : "Renderizacao iniciada",
 
         language:
@@ -1565,14 +2388,19 @@ app.post(
     );
 
     setImmediate(
-      () => {
+      () =>
         processVideo(
           jobId,
           {
+
             images,
+
             audioUrl,
+
             text,
+
             narrationText,
+
             duration,
 
             captions:
@@ -1582,20 +2410,17 @@ app.post(
                 ? captions
                 : [],
 
-            language:
-              DEFAULT_LANGUAGE,
-
             voice,
 
             rate
           }
-        );
-      }
+        )
     );
 
-    return res
+    res
       .status(202)
       .json({
+
         success:
           true,
 
@@ -1626,24 +2451,28 @@ app.post(
 
         message:
           textToSpeak
+
             ? "Renderizacao iniciada com voz e legendas automaticas"
+
             : "Renderizacao iniciada",
 
         statusUrl:
-          `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` +
-          `/status/${jobId}`
+          `${publicBaseUrl()}/status/${jobId}`
       });
   }
 );
 
 /* =========================================================
-   STATUS
+   STATUS VIDEO
 ========================================================= */
 
 app.get(
   "/status/:jobId",
   requireApiKey,
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
 
     const job =
       jobs.get(
@@ -1651,25 +2480,151 @@ app.get(
       );
 
     if (!job) {
+
       return res
         .status(404)
         .json({
-          success: false,
+
+          success:
+            false,
 
           error:
             "Job nao encontrado."
         });
     }
 
-    return res.json({
-      success: true,
+    res.json({
+
+      success:
+        true,
+
       ...job
     });
   }
 );
 
 /* =========================================================
-   SERVIDOR
+   HOME
+========================================================= */
+
+app.get(
+  "/",
+  (
+    req,
+    res
+  ) => {
+
+    res.json({
+
+      success:
+        true,
+
+      service:
+        "Curioso AI Video API",
+
+      status:
+        "online",
+
+      defaultLanguage:
+        DEFAULT_LANGUAGE,
+
+      defaultVoice:
+        DEFAULT_VOICE,
+
+      narrationProvider:
+        "edge-tts",
+
+      automaticCaptions:
+        true,
+
+      imageGeneration:
+        true,
+
+      imageProvider:
+        "pollinations",
+
+      defaultImageModel:
+        DEFAULT_IMAGE_MODEL,
+
+      resolution:
+        "1080x1920",
+
+      fps:
+        30
+    });
+  }
+);
+
+/* =========================================================
+   HEALTH
+========================================================= */
+
+app.get(
+  "/health",
+  (
+    req,
+    res
+  ) => {
+
+    execFile(
+      "ffmpeg",
+      [
+        "-version"
+      ],
+      (
+        ffmpegError
+      ) => {
+
+        execFile(
+          "ffprobe",
+          [
+            "-version"
+          ],
+          (
+            ffprobeError
+          ) => {
+
+            res.json({
+
+              success:
+                true,
+
+              status:
+                "healthy",
+
+              ffmpeg:
+                !ffmpegError,
+
+              ffprobe:
+                !ffprobeError,
+
+              edgeTts:
+                true,
+
+              pollinationsConfigured:
+                Boolean(
+                  process.env
+                    .POLLINATIONS_API_KEY
+                ),
+
+              language:
+                DEFAULT_LANGUAGE,
+
+              defaultVoice:
+                DEFAULT_VOICE,
+
+              defaultImageModel:
+                DEFAULT_IMAGE_MODEL
+            });
+          }
+        );
+      }
+    );
+  }
+);
+
+/* =========================================================
+   INICIAR SERVIDOR
 ========================================================= */
 
 app.listen(
@@ -1682,11 +2637,16 @@ app.listen(
     );
 
     console.log(
-      `Idioma padrao: ${DEFAULT_LANGUAGE}`
+      `Edge TTS: ${DEFAULT_VOICE}`
     );
 
     console.log(
-      `Voz padrao Edge TTS: ${DEFAULT_VOICE}`
+      `Pollinations configurado: ${
+        Boolean(
+          process.env
+            .POLLINATIONS_API_KEY
+        )
+      }`
     );
   }
 );
