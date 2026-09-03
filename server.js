@@ -7,50 +7,42 @@ const crypto = require("crypto");
 const { EdgeTTS } = require("node-edge-tts");
 
 const app = express();
+
 app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 10000;
 
 const OUTPUT_DIR = path.join(__dirname, "outputs");
 const TEMP_DIR = path.join(__dirname, "temp");
-const GENERATED_IMAGES_DIR = path.join(__dirname, "generated-images");
+const IMAGE_OUTPUT_DIR = path.join(OUTPUT_DIR, "images");
 
 const DEFAULT_LANGUAGE = "pt-BR";
 const DEFAULT_VOICE = "pt-BR-AntonioNeural";
 const DEFAULT_RATE = "-5%";
-const DEFAULT_IMAGE_MODEL = "flux";
 
-for (const dir of [
-  OUTPUT_DIR,
-  TEMP_DIR,
-  GENERATED_IMAGES_DIR
-]) {
-  fs.mkdirSync(dir, {
-    recursive: true
-  });
-}
+const DEFAULT_IMAGE_MODEL =
+  process.env.CLOUDFLARE_IMAGE_MODEL ||
+  "@cf/black-forest-labs/flux-1-schnell";
 
-app.use(
-  "/videos",
-  express.static(OUTPUT_DIR)
-);
+fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+fs.mkdirSync(TEMP_DIR, { recursive: true });
+fs.mkdirSync(IMAGE_OUTPUT_DIR, { recursive: true });
 
-app.use(
-  "/generated-images",
-  express.static(GENERATED_IMAGES_DIR)
-);
+app.use("/videos", express.static(OUTPUT_DIR));
 
 const jobs = new Map();
 const imageJobs = new Map();
 
 /* =========================================================
-   FUNCOES BASICAS
+   UTILIDADES
 ========================================================= */
 
 function publicBaseUrl() {
-  return process.env.RENDER_EXTERNAL_HOSTNAME
-    ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`
-    : `http://localhost:${PORT}`;
+  if (process.env.RENDER_EXTERNAL_HOSTNAME) {
+    return `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`;
+  }
+
+  return `http://localhost:${PORT}`;
 }
 
 function cleanText(text) {
@@ -61,161 +53,126 @@ function cleanText(text) {
     .trim();
 }
 
-function safeUnlink(file) {
+function normalizeCaptionText(text) {
+  return cleanText(text)
+    .replace(/\s+([,.!?;:])/g, "$1")
+    .replace(/([¿¡])\s+/g, "$1");
+}
+
+function safeUnlink(filePath) {
   try {
-    if (fs.existsSync(file)) {
-      fs.unlinkSync(file);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
     }
   } catch (_) {}
 }
 
 /* =========================================================
-   EXECUTAR COMANDOS
+   FFMPEG / FFPROBE
 ========================================================= */
 
-function run(
+function runCommand(
   command,
   args,
   maxBuffer = 20 * 1024 * 1024
 ) {
-  return new Promise(
-    (resolve, reject) => {
+  return new Promise((resolve, reject) => {
+    execFile(
+      command,
+      args,
+      { maxBuffer },
+      (error, stdout, stderr) => {
+        if (error) {
+          console.error(`ERRO ${command.toUpperCase()}:`);
+          console.error(stderr || error.message);
 
-      execFile(
-        command,
-        args,
-        {
-          maxBuffer
-        },
-        (
-          error,
-          stdout,
-          stderr
-        ) => {
-
-          if (error) {
-            console.error(
-              `ERRO ${command.toUpperCase()}:`,
-              stderr || error.message
-            );
-
-            return reject(
-              new Error(
-                stderr ||
+          return reject(
+            new Error(
+              stderr ||
                 error.message ||
-                `Erro em ${command}`
-              )
-            );
-          }
-
-          resolve(stdout);
+                `Erro desconhecido em ${command}`
+            )
+          );
         }
-      );
-    }
-  );
+
+        resolve(stdout);
+      }
+    );
+  });
 }
 
-/* =========================================================
-   DURACAO AUDIO
-========================================================= */
-
-async function mediaDuration(
-  file
-) {
-
-  const out = await run(
+async function getMediaDuration(filePath) {
+  const stdout = await runCommand(
     "ffprobe",
     [
       "-v",
       "error",
-
       "-show_entries",
       "format=duration",
-
       "-of",
       "default=noprint_wrappers=1:nokey=1",
-
-      file
+      filePath
     ],
     1024 * 1024
   );
 
-  const value =
-    Number(
-      String(out).trim()
-    );
+  const duration = Number(String(stdout).trim());
 
   if (
-    !Number.isFinite(value) ||
-    value <= 0
+    !Number.isFinite(duration) ||
+    duration <= 0
   ) {
     throw new Error(
-      "Duracao de audio invalida."
+      "Nao foi possivel obter a duracao do audio."
     );
   }
 
-  return value;
+  return duration;
 }
 
 /* =========================================================
-   SEGURANCA API
+   API KEY DA NOSSA API
 ========================================================= */
 
-function requireApiKey(
-  req,
-  res,
-  next
-) {
-
-  const expected =
+function requireApiKey(req, res, next) {
+  const expectedKey =
     process.env.VIDEO_API_KEY;
 
-  const received =
+  const receivedKey =
     req.get("x-api-key");
 
-  if (!expected) {
-
-    return res
-      .status(503)
-      .json({
-        success: false,
-        error:
-          "API ainda nao configurada."
-      });
+  if (!expectedKey) {
+    return res.status(503).json({
+      success: false,
+      error: "API ainda nao configurada."
+    });
   }
 
-  if (!received) {
-
-    return res
-      .status(401)
-      .json({
-        success: false,
-        error:
-          "API key nao informada."
-      });
+  if (!receivedKey) {
+    return res.status(401).json({
+      success: false,
+      error: "API key nao informada."
+    });
   }
 
-  const a =
-    Buffer.from(expected);
+  const expectedBuffer =
+    Buffer.from(expectedKey);
 
-  const b =
-    Buffer.from(received);
+  const receivedBuffer =
+    Buffer.from(receivedKey);
 
   if (
-    a.length !== b.length ||
+    expectedBuffer.length !==
+      receivedBuffer.length ||
     !crypto.timingSafeEqual(
-      a,
-      b
+      expectedBuffer,
+      receivedBuffer
     )
   ) {
-
-    return res
-      .status(401)
-      .json({
-        success: false,
-        error:
-          "API key invalida."
-      });
+    return res.status(401).json({
+      success: false,
+      error: "API key invalida."
+    });
   }
 
   next();
@@ -229,44 +186,26 @@ async function downloadFile(
   url,
   destination
 ) {
-
-  const response =
-    await axios({
-
-      method:
-        "GET",
-
-      url,
-
-      responseType:
-        "stream",
-
-      timeout:
-        120000,
-
-      maxRedirects:
-        5,
-
-      headers: {
-        "User-Agent":
-          "Curioso-AI-Studio/1.0"
-      }
-    });
+  const response = await axios({
+    method: "GET",
+    url,
+    responseType: "stream",
+    timeout: 120000,
+    maxRedirects: 5,
+    headers: {
+      "User-Agent":
+        "Curioso-AI-Studio/1.0"
+    }
+  });
 
   await new Promise(
-    (
-      resolve,
-      reject
-    ) => {
-
+    (resolve, reject) => {
       const writer =
         fs.createWriteStream(
           destination
         );
 
-      response.data.pipe(
-        writer
-      );
+      response.data.pipe(writer);
 
       writer.on(
         "finish",
@@ -282,236 +221,272 @@ async function downloadFile(
 }
 
 /* =========================================================
-   IMAGEM - PROMPT FINAL
+   GERACAO DE IMAGENS - CLOUDFLARE
 ========================================================= */
 
-function finalImagePrompt(
-  scenePrompt,
-  style
+function getCloudflareImageModel(
+  requestedModel
 ) {
-
-  return cleanText(
-
-    `${scenePrompt}. ` +
-
-    `${
-      style ||
-      "cinematic documentary photography, realistic, dramatic lighting, investigative atmosphere, vertical 9:16 portrait composition"
-    }. ` +
-
-    "no text, no captions, no subtitles, no letters, no logo, no watermark, no frame, no collage, one single full-screen scene"
+  return (
+    cleanText(requestedModel) ||
+    process.env.CLOUDFLARE_IMAGE_MODEL ||
+    "@cf/black-forest-labs/flux-1-schnell"
   );
 }
 
-/* =========================================================
-   GERAR 1 IMAGEM NO POLLINATIONS
-========================================================= */
+function normalizeImagePrompts(body) {
+  if (
+    Array.isArray(body.prompts) &&
+    body.prompts.length > 0
+  ) {
+    return body.prompts
+      .map((item, index) => {
+        if (
+          typeof item === "string"
+        ) {
+          return {
+            sceneNumber: index + 1,
+            title: `Cena ${index + 1}`,
+            prompt: cleanText(item)
+          };
+        }
 
-async function generatePollinationsImage({
-  prompt,
-  outputPath,
-  model = DEFAULT_IMAGE_MODEL,
-  seed,
-  enhance = true,
-  safe = true
-}) {
+        if (
+          item &&
+          typeof item === "object"
+        ) {
+          return {
+            sceneNumber:
+              Number(
+                item.sceneNumber
+              ) ||
+              index + 1,
 
-  const key =
-    process.env
-      .POLLINATIONS_API_KEY;
+            title:
+              cleanText(
+                item.title
+              ) ||
+              `Cena ${index + 1}`,
 
-  if (!key) {
+            prompt:
+              cleanText(
+                item.imagePrompt ||
+                item.prompt
+              )
+          };
+        }
 
-    throw new Error(
-      "POLLINATIONS_API_KEY nao configurada no Render."
-    );
-  }
-
-  const normalizedPrompt =
-    cleanText(prompt)
-      .slice(
-        0,
-        1800
+        return null;
+      })
+      .filter(
+        item =>
+          item &&
+          item.prompt
       );
-
-  if (!normalizedPrompt) {
-
-    throw new Error(
-      "Prompt da imagem vazio."
-    );
   }
-
-  const params =
-    new URLSearchParams({
-
-      model:
-        cleanText(model) ||
-        DEFAULT_IMAGE_MODEL,
-
-      width:
-        "1080",
-
-      height:
-        "1920",
-
-      nologo:
-        "true",
-
-      private:
-        "true",
-
-      enhance:
-        enhance
-          ? "true"
-          : "false",
-
-      safe:
-        safe
-          ? "true"
-          : "false"
-    });
 
   if (
-    Number.isFinite(
-      Number(seed)
-    )
+    Array.isArray(body.scenes) &&
+    body.scenes.length > 0
   ) {
+    return body.scenes
+      .map((scene, index) => {
+        if (
+          typeof scene === "string"
+        ) {
+          return {
+            sceneNumber: index + 1,
+            title: `Cena ${index + 1}`,
+            prompt: cleanText(scene)
+          };
+        }
 
-    params.set(
-      "seed",
-      String(
-        Math.floor(
-          Number(seed)
-        )
-      )
+        if (
+          scene &&
+          typeof scene === "object"
+        ) {
+          return {
+            sceneNumber:
+              Number(
+                scene.sceneNumber
+              ) ||
+              index + 1,
+
+            title:
+              cleanText(
+                scene.title
+              ) ||
+              `Cena ${index + 1}`,
+
+            prompt:
+              cleanText(
+                scene.imagePrompt ||
+                scene.prompt
+              )
+          };
+        }
+
+        return null;
+      })
+      .filter(
+        item =>
+          item &&
+          item.prompt
+      );
+  }
+
+  if (
+    typeof body.prompt ===
+      "string" &&
+    cleanText(body.prompt)
+  ) {
+    return [
+      {
+        sceneNumber: 1,
+        title:
+          cleanText(
+            body.title
+          ) ||
+          "Cena 1",
+
+        prompt:
+          cleanText(
+            body.prompt
+          )
+      }
+    ];
+  }
+
+  return [];
+}
+
+function buildFinalImagePrompt(
+  prompt,
+  style
+) {
+  const baseStyle =
+    cleanText(style) ||
+    "cinematic documentary photography, realistic, dramatic lighting, investigative atmosphere, vertical portrait composition";
+
+  return cleanText(
+    `${prompt}. ${baseStyle}. ` +
+      "single full-screen scene, no collage, no split screen, no text, no subtitles, no letters, no logo, no watermark"
+  ).slice(
+    0,
+    2048
+  );
+}
+
+async function generateCloudflareImage({
+  prompt,
+  model,
+  seed,
+  outputPath
+}) {
+  const accountId =
+    process.env
+      .CLOUDFLARE_ACCOUNT_ID;
+
+  const apiToken =
+    process.env
+      .CLOUDFLARE_API_TOKEN;
+
+  if (
+    !accountId ||
+    !apiToken
+  ) {
+    throw new Error(
+      "Cloudflare nao configurado. Verifique CLOUDFLARE_ACCOUNT_ID e CLOUDFLARE_API_TOKEN."
     );
   }
 
   const url =
-    `https://gen.pollinations.ai/image/` +
-    `${encodeURIComponent(
-      normalizedPrompt
-    )}?${params}`;
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}` +
+    `/ai/run/${model}`;
 
-  const source =
-    `${outputPath}.source`;
+  const response =
+    await axios({
+      method: "POST",
 
-  try {
+      url,
 
-    const response =
-      await axios({
+      timeout: 240000,
 
-        method:
-          "GET",
+      maxContentLength:
+        Infinity,
 
-        url,
+      maxBodyLength:
+        Infinity,
 
-        responseType:
-          "arraybuffer",
+      headers: {
+        Authorization:
+          `Bearer ${apiToken}`,
 
-        timeout:
-          240000,
+        "Content-Type":
+          "application/json"
+      },
 
-        maxRedirects:
-          5,
+      data: {
+        prompt,
+        steps: 4,
+        seed
+      },
 
-        maxContentLength:
-          Infinity,
+      validateStatus:
+        () => true
+    });
 
-        maxBodyLength:
-          Infinity,
-
-        headers: {
-
-          Authorization:
-            `Bearer ${key}`,
-
-          Accept:
-            "image/*",
-
-          "User-Agent":
-            "Curioso-AI-Studio/1.0"
-        },
-
-        validateStatus:
-          () => true
-      });
-
-    if (
-      response.status < 200 ||
-      response.status >= 300
-    ) {
-
-      const detail =
-        Buffer
-          .from(
-            response.data
-          )
-          .toString("utf8")
-          .slice(
-            0,
-            1000
-          );
-
-      throw new Error(
-        `Pollinations HTTP ${response.status}` +
-        (
-          detail
-            ? `: ${detail}`
-            : ""
-        )
-      );
-    }
-
-    const contentType =
-      String(
-        response
-          .headers[
-            "content-type"
-          ] || ""
-      );
-
-    if (
-      !contentType
-        .startsWith(
-          "image/"
-        )
-    ) {
-
-      const detail =
-        Buffer
-          .from(
-            response.data
-          )
-          .toString("utf8")
-          .slice(
-            0,
-            1000
-          );
-
-      throw new Error(
-        `Pollinations nao retornou imagem (${contentType}). ${detail}`
-      );
-    }
-
-    fs.writeFileSync(
-      source,
-      Buffer.from(
+  if (
+    response.status < 200 ||
+    response.status >= 300
+  ) {
+    throw new Error(
+      `Cloudflare HTTP ${response.status}: ${JSON.stringify(
         response.data
-      )
+      )}`
+    );
+  }
+
+  const imageBase64 =
+    response?.data?.result?.image ||
+    response?.data?.image ||
+    null;
+
+  if (!imageBase64) {
+    throw new Error(
+      `Cloudflare nao retornou a imagem esperada: ${JSON.stringify(
+        response.data
+      )}`
+    );
+  }
+
+  const sourcePath =
+    `${outputPath}.source.jpg`;
+
+  const normalizedBase64 =
+    String(
+      imageBase64
+    ).replace(
+      /^data:image\/[a-zA-Z0-9.+-]+;base64,/,
+      ""
     );
 
-    /*
-      NORMALIZA PARA 1080x1920
-    */
+  fs.writeFileSync(
+    sourcePath,
+    Buffer.from(
+      normalizedBase64,
+      "base64"
+    )
+  );
 
-    await run(
+  try {
+    await runCommand(
       "ffmpeg",
       [
         "-y",
 
         "-i",
-        source,
+        sourcePath,
 
         "-vf",
         "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
@@ -525,121 +500,119 @@ async function generatePollinationsImage({
         outputPath
       ]
     );
-
-    if (
-      !fs.existsSync(
-        outputPath
-      ) ||
-      !fs
-        .statSync(
-          outputPath
-        )
-        .size
-    ) {
-
-      throw new Error(
-        "Imagem final nao foi criada."
-      );
-    }
-
   } finally {
-
     safeUnlink(
-      source
+      sourcePath
+    );
+  }
+
+  if (
+    !fs.existsSync(
+      outputPath
+    ) ||
+    fs.statSync(
+      outputPath
+    ).size === 0
+  ) {
+    throw new Error(
+      "Imagem final nao foi criada corretamente."
     );
   }
 }
 
-/* =========================================================
-   GERAR LOTE DE IMAGENS
-========================================================= */
-
-async function processImageBatch(
+async function processImageJob(
   jobId,
-  {
-    scenes,
-    model,
-    style,
-    enhance,
-    safe
-  }
+  data
 ) {
-
   const job =
     imageJobs.get(
       jobId
     );
 
   try {
-
-    const dir =
-      path.join(
-        GENERATED_IMAGES_DIR,
-        jobId
+    const scenes =
+      normalizeImagePrompts(
+        data
       );
 
-    fs.mkdirSync(
-      dir,
-      {
-        recursive: true
-      }
-    );
+    const model =
+      getCloudflareImageModel(
+        data.model
+      );
+
+    const style =
+      data.style;
 
     job.status =
       "processing";
 
+    job.progress =
+      5;
+
     job.message =
       `Preparando ${scenes.length} imagens`;
 
-    const results = [];
+    job.model =
+      model;
+
+    job.totalImages =
+      scenes.length;
+
+    job.generatedCount =
+      0;
+
+    job.images =
+      [];
 
     for (
       let i = 0;
       i < scenes.length;
       i++
     ) {
-
       const scene =
-        scenes[i] || {};
+        scenes[i];
 
-      const sceneNumber =
-        Number(
-          scene.sceneNumber
-        ) ||
-        i + 1;
-
-      const prompt =
-        cleanText(
-          scene.imagePrompt ||
-          scene.prompt
-        );
-
-      if (!prompt) {
-
-        throw new Error(
-          `Cena ${sceneNumber} sem imagePrompt.`
-        );
-      }
+      const seed =
+        Number.isFinite(
+          Number(
+            data.seed
+          )
+        )
+          ? Math.floor(
+              Number(
+                data.seed
+              )
+            ) + i
+          : crypto.randomInt(
+              1,
+              2147483646
+            );
 
       job.currentScene =
-        sceneNumber;
+        scene.sceneNumber;
 
       job.progress =
         Math.max(
-          2,
+          10,
           Math.round(
             (
               i /
               scenes.length
-            ) * 95
+            ) * 90
           )
         );
 
       job.message =
         `Gerando imagem ${i + 1} de ${scenes.length}`;
 
+      const finalPrompt =
+        buildFinalImagePrompt(
+          scene.prompt,
+          style
+        );
+
       const fileName =
-        `scene-${String(
+        `${jobId}-${String(
           i + 1
         ).padStart(
           2,
@@ -648,81 +621,44 @@ async function processImageBatch(
 
       const outputPath =
         path.join(
-          dir,
+          IMAGE_OUTPUT_DIR,
           fileName
         );
 
-      const seed =
-        Number.isFinite(
-          Number(
-            scene.seed
-          )
-        )
-
-          ? Number(
-              scene.seed
-            )
-
-          : crypto
-              .randomInt(
-                1,
-                2147483646
-              );
-
-      const builtPrompt =
-        finalImagePrompt(
-          prompt,
-          style
-        );
-
-      await generatePollinationsImage({
+      await generateCloudflareImage({
         prompt:
-          builtPrompt,
-
-        outputPath,
+          finalPrompt,
 
         model,
 
         seed,
 
-        enhance,
-
-        safe
+        outputPath
       });
 
-      const item = {
+      const imageUrl =
+        `${publicBaseUrl()}` +
+        `/videos/images/${fileName}`;
 
-        sceneNumber,
+      job.images.push({
+        sceneNumber:
+          scene.sceneNumber,
 
         title:
-          cleanText(
-            scene.title ||
-            `Cena ${sceneNumber}`
-          ),
+          scene.title,
 
-        imagePrompt:
-          prompt,
+        prompt:
+          scene.prompt,
 
         seed,
 
-        imageUrl:
-          `${publicBaseUrl()}` +
-          `/generated-images/` +
-          `${jobId}/` +
-          `${fileName}`
-      };
+        imageUrl,
 
-      results.push(
-        item
-      );
-
-      job.images =
-        [
-          ...results
-        ];
+        fileName
+      });
 
       job.generatedCount =
-        results.length;
+        job.images.length;
 
       job.progress =
         Math.round(
@@ -744,22 +680,21 @@ async function processImageBatch(
     job.message =
       "Imagens geradas com sucesso";
 
-    job.images =
-      results;
-
     job.imageUrls =
-      results.map(
-        x =>
-          x.imageUrl
+      job.images.map(
+        item =>
+          item.imageUrl
       );
 
-    job.generatedCount =
-      results.length;
+    job.resolution =
+      "1080x1920";
+
+    job.aspectRatio =
+      "9:16";
 
   } catch (error) {
-
     console.error(
-      "ERRO IMAGENS:",
+      "ERRO NO JOB DE IMAGENS:",
       error
     );
 
@@ -779,37 +714,36 @@ async function processImageBatch(
 }
 
 /* =========================================================
-   LEGENDAS - TEMPO ASS
+   LEGENDAS ASS
 ========================================================= */
 
 function assTime(
   seconds
 ) {
-
   const total =
     Math.max(
       0,
       Number(seconds) || 0
     );
 
-  const h =
+  const hours =
     Math.floor(
       total / 3600
     );
 
-  const m =
+  const minutes =
     Math.floor(
       (
         total % 3600
       ) / 60
     );
 
-  const s =
+  const secs =
     Math.floor(
       total % 60
     );
 
-  const cs =
+  const centiseconds =
     Math.floor(
       (
         total % 1
@@ -817,66 +751,66 @@ function assTime(
     );
 
   return (
-    `${h}:` +
-    `${String(m).padStart(2, "0")}:` +
-    `${String(s).padStart(2, "0")}.` +
-    `${String(cs).padStart(2, "0")}`
+    `${hours}:` +
+    `${String(minutes).padStart(2, "0")}:` +
+    `${String(secs).padStart(2, "0")}.` +
+    `${String(centiseconds).padStart(2, "0")}`
   );
 }
 
-/* =========================================================
-   QUEBRAR LEGENDA
-========================================================= */
-
 function wrapCaptionText(
   text,
-  maxChars = 16
+  maxCharsPerLine = 16
 ) {
+  const cleaned =
+    cleanText(text);
+
+  if (!cleaned) {
+    return "";
+  }
 
   const words =
-    cleanText(text)
-      .split(" ")
-      .filter(Boolean);
+    cleaned.split(" ");
 
-  const lines = [];
+  const lines =
+    [];
 
-  let line = "";
+  let currentLine =
+    "";
 
   for (
     const word of words
   ) {
-
     const candidate =
-      line
-        ? `${line} ${word}`
+      currentLine
+        ? `${currentLine} ${word}`
         : word;
 
     if (
       candidate.length <=
-      maxChars
+      maxCharsPerLine
     ) {
-
-      line =
+      currentLine =
         candidate;
-
     } else {
-
-      if (line) {
-
+      if (
+        currentLine
+      ) {
         lines.push(
-          line
+          currentLine
         );
       }
 
-      line =
+      currentLine =
         word;
     }
   }
 
-  if (line) {
-
+  if (
+    currentLine
+  ) {
     lines.push(
-      line
+      currentLine
     );
   }
 
@@ -885,16 +819,27 @@ function wrapCaptionText(
   );
 }
 
-/* =========================================================
-   CRIAR ASS
-========================================================= */
+function escapeAssText(
+  text
+) {
+  return wrapCaptionText(
+    text
+  )
+    .replace(
+      /{/g,
+      "\\{"
+    )
+    .replace(
+      /}/g,
+      "\\}"
+    );
+}
 
 function createAssFile(
   captions,
   filePath,
   duration
 ) {
-
   let ass =
 `[Script Info]
 Title: Curioso AI Studio
@@ -913,39 +858,36 @@ Style: Curioso,DejaVu Sans,54,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 `;
 
-  for (
-    const c of captions
-  ) {
+  captions.forEach(
+    caption => {
 
-    const text =
-      wrapCaptionText(
-        c.text
-      )
-        .replace(
-          /{/g,
-          "\\{"
-        )
-        .replace(
-          /}/g,
-          "\\}"
+      const start =
+        assTime(
+          caption.start ||
+          0
         );
 
-    if (!text) {
-      continue;
-    }
+      const end =
+        assTime(
+          caption.end !==
+            undefined
+            ? caption.end
+            : duration
+        );
 
-    ass +=
-      `Dialogue: 0,` +
-      `${assTime(
-        c.start || 0
-      )},` +
-      `${assTime(
-        c.end ??
-        duration
-      )},` +
-      `Curioso,,0,0,0,,` +
-      `${text}\n`;
-  }
+      const text =
+        escapeAssText(
+          caption.text
+        );
+
+      if (!text) {
+        return;
+      }
+
+      ass +=
+        `Dialogue: 0,${start},${end},Curioso,,0,0,0,,${text}\n`;
+    }
+  );
 
   fs.writeFileSync(
     filePath,
@@ -961,121 +903,109 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 function validateVoice(
   voice
 ) {
-
-  const v =
+  const value =
     String(
       voice ||
       DEFAULT_VOICE
     ).trim();
 
-  return v.startsWith(
+  return value.startsWith(
     "pt-BR-"
   )
-    ? v
+    ? value
     : DEFAULT_VOICE;
 }
 
 function validateRate(
   rate
 ) {
-
-  const r =
+  const value =
     String(
       rate ||
       DEFAULT_RATE
     ).trim();
 
-  return (
-    r === "default" ||
+  if (
+    value ===
+    "default"
+  ) {
+    return value;
+  }
+
+  if (
     /^[+-]\d{1,2}%$/.test(
-      r
+      value
     )
-  )
-    ? r
-    : DEFAULT_RATE;
+  ) {
+    return value;
+  }
+
+  return DEFAULT_RATE;
 }
-
-function normalizeCaptionText(
-  text
-) {
-
-  return cleanText(text)
-
-    .replace(
-      /\s+([,.!?;:])/g,
-      "$1"
-    )
-
-    .replace(
-      /([¿¡])\s+/g,
-      "$1"
-    );
-}
-
-/* =========================================================
-   TEMPOS AUTOMATICOS
-========================================================= */
 
 function buildCaptionsFromWordTimings(
-  timings
+  wordTimings
 ) {
+  const captions =
+    [];
 
-  const captions = [];
+  let parts =
+    [];
 
-  let parts = [];
-  let startMs = null;
-  let endMs = null;
+  let startMs =
+    null;
 
-  const flush =
-    () => {
+  let endMs =
+    null;
 
-      if (
-        !parts.length ||
-        startMs === null ||
-        endMs === null
-      ) {
-
-        return;
-      }
-
-      const text =
-        normalizeCaptionText(
-          parts.join(" ")
-        );
-
-      if (text) {
-
-        captions.push({
-
-          text,
-
-          start:
-            Number(
-              (
-                startMs /
-                1000
-              ).toFixed(3)
-            ),
-
-          end:
-            Number(
-              (
-                endMs /
-                1000
-              ).toFixed(3)
-            )
-        });
-      }
-
+  function flush() {
+    if (
+      !parts.length ||
+      startMs === null ||
+      endMs === null
+    ) {
       parts = [];
       startMs = null;
       endMs = null;
-    };
+      return;
+    }
+
+    const text =
+      normalizeCaptionText(
+        parts.join(" ")
+      );
+
+    if (text) {
+      captions.push({
+        text,
+
+        start:
+          Number(
+            (
+              startMs /
+              1000
+            ).toFixed(3)
+          ),
+
+        end:
+          Number(
+            (
+              endMs /
+              1000
+            ).toFixed(3)
+          )
+      });
+    }
+
+    parts = [];
+    startMs = null;
+    endMs = null;
+  }
 
   for (
-    const cue of timings
+    const cue of
+      wordTimings
   ) {
-
     const part =
       normalizeCaptionText(
         cue?.part
@@ -1099,13 +1029,13 @@ function buildCaptionsFromWordTimings(
       !Number.isFinite(
         cueEnd
       ) ||
-      cueEnd <= cueStart
+      cueEnd <=
+        cueStart
     ) {
-
       continue;
     }
 
-    const candidate =
+    const candidateText =
       normalizeCaptionText(
         [
           ...parts,
@@ -1125,21 +1055,21 @@ function buildCaptionsFromWordTimings(
       ) / 1000;
 
     if (
-      parts.length &&
+      parts.length > 0 &&
       (
         parts.length >= 5 ||
-        candidate.length > 32 ||
-        candidateDuration > 2.6
+        candidateText.length >
+          32 ||
+        candidateDuration >
+          2.6
       )
     ) {
-
       flush();
     }
 
     if (
       startMs === null
     ) {
-
       startMs =
         cueStart;
     }
@@ -1152,14 +1082,17 @@ function buildCaptionsFromWordTimings(
       cueEnd;
 
     if (
-      /[.!?…]$/.test(part) ||
+      /[.!?…]$/.test(
+        part
+      ) ||
       (
-        /[,:;]$/.test(part) &&
+        /[,:;]$/.test(
+          part
+        ) &&
         parts.length >= 3
       ) ||
       parts.length >= 5
     ) {
-
       flush();
     }
   }
@@ -1169,22 +1102,18 @@ function buildCaptionsFromWordTimings(
   return captions;
 }
 
-/* =========================================================
-   GERAR NARRACAO
-========================================================= */
-
 async function generateEdgeNarration({
   text,
   audioPath,
   voice,
   rate
 }) {
-
-  const narration =
+  const narrationText =
     cleanText(text);
 
-  if (!narration) {
-
+  if (
+    !narrationText
+  ) {
     throw new Error(
       "Texto da narracao nao informado."
     );
@@ -1202,7 +1131,6 @@ async function generateEdgeNarration({
 
   const tts =
     new EdgeTTS({
-
       voice:
         selectedVoice,
 
@@ -1229,7 +1157,7 @@ async function generateEdgeNarration({
     });
 
   await tts.ttsPromise(
-    narration,
+    narrationText,
     audioPath
   );
 
@@ -1237,15 +1165,12 @@ async function generateEdgeNarration({
     !fs.existsSync(
       audioPath
     ) ||
-    !fs
-      .statSync(
-        audioPath
-      )
-      .size
+    fs.statSync(
+      audioPath
+    ).size === 0
   ) {
-
     throw new Error(
-      "Edge TTS nao gerou audio."
+      "Edge TTS nao gerou o arquivo de audio."
     );
   }
 
@@ -1257,13 +1182,12 @@ async function generateEdgeNarration({
       subtitlePath
     )
   ) {
-
     throw new Error(
-      "Edge TTS nao gerou timestamps."
+      "Edge TTS nao gerou os timestamps das legendas."
     );
   }
 
-  const timings =
+  const wordTimings =
     JSON.parse(
       fs.readFileSync(
         subtitlePath,
@@ -1273,27 +1197,32 @@ async function generateEdgeNarration({
 
   if (
     !Array.isArray(
-      timings
+      wordTimings
     ) ||
-    !timings.length
+    wordTimings.length ===
+      0
   ) {
-
     throw new Error(
-      "Timestamps do Edge TTS vazios."
+      "Edge TTS retornou timestamps vazios."
     );
   }
 
+  const duration =
+    await getMediaDuration(
+      audioPath
+    );
+
+  const captions =
+    buildCaptionsFromWordTimings(
+      wordTimings
+    );
+
   return {
+    audioPath,
 
-    duration:
-      await mediaDuration(
-        audioPath
-      ),
+    duration,
 
-    captions:
-      buildCaptionsFromWordTimings(
-        timings
-      ),
+    captions,
 
     voice:
       selectedVoice,
@@ -1304,18 +1233,30 @@ async function generateEdgeNarration({
 }
 
 /* =========================================================
-   PROCESSAR VIDEO
+   PROCESSAMENTO DO VIDEO
 ========================================================= */
 
 async function processVideo(
   jobId,
   data
 ) {
-
   const job =
     jobs.get(
       jobId
     );
+
+  const {
+    images,
+    audioUrl,
+    text,
+    narrationText,
+    duration,
+    captions = [],
+    voice =
+      DEFAULT_VOICE,
+    rate =
+      DEFAULT_RATE
+  } = data;
 
   const jobDir =
     path.join(
@@ -1331,18 +1272,6 @@ async function processVideo(
   );
 
   try {
-
-    const {
-      images,
-      audioUrl,
-      text,
-      narrationText,
-      duration,
-      captions = [],
-      voice = DEFAULT_VOICE,
-      rate = DEFAULT_RATE
-    } = data;
-
     job.status =
       "processing";
 
@@ -1352,15 +1281,15 @@ async function processVideo(
     job.message =
       "Baixando imagens";
 
-    const imageFiles = [];
+    const imageFiles =
+      [];
 
     for (
       let i = 0;
       i < images.length;
       i++
     ) {
-
-      const file =
+      const imagePath =
         path.join(
           jobDir,
           `image-${i}.jpg`
@@ -1368,11 +1297,11 @@ async function processVideo(
 
       await downloadFile(
         images[i],
-        file
+        imagePath
       );
 
       imageFiles.push(
-        file
+        imagePath
       );
     }
 
@@ -1389,21 +1318,25 @@ async function processVideo(
       );
 
     let finalDuration;
+
     let finalCaptions;
-    let finalVoice = null;
+
+    let finalVoice =
+      null;
+
     let narrationProvider;
 
     job.progress =
       12;
 
-    if (textToSpeak) {
-
+    if (
+      textToSpeak
+    ) {
       job.message =
         "Gerando narracao e legendas sincronizadas";
 
-      const tts =
+      const ttsResult =
         await generateEdgeNarration({
-
           text:
             textToSpeak,
 
@@ -1415,13 +1348,13 @@ async function processVideo(
         });
 
       finalDuration =
-        tts.duration;
+        ttsResult.duration;
 
       finalCaptions =
-        tts.captions;
+        ttsResult.captions;
 
       finalVoice =
-        tts.voice;
+        ttsResult.voice;
 
       narrationProvider =
         "edge-tts";
@@ -1432,9 +1365,8 @@ async function processVideo(
     } else {
 
       if (!audioUrl) {
-
         throw new Error(
-          "Informe text/narrationText ou audioUrl."
+          "Informe text/narrationText para gerar a voz automaticamente ou audioUrl para usar audio pronto."
         );
       }
 
@@ -1446,20 +1378,18 @@ async function processVideo(
         audioPath
       );
 
-      const supplied =
+      const suppliedDuration =
         Number(
           duration
         );
 
       finalDuration =
         Number.isFinite(
-          supplied
+          suppliedDuration
         ) &&
-        supplied > 0
-
-          ? supplied
-
-          : await mediaDuration(
+        suppliedDuration > 0
+          ? suppliedDuration
+          : await getMediaDuration(
               audioPath
             );
 
@@ -1481,8 +1411,9 @@ async function processVideo(
 
     job.duration =
       Number(
-        finalDuration
-          .toFixed(3)
+        finalDuration.toFixed(
+          3
+        )
       );
 
     job.captionCount =
@@ -1494,19 +1425,25 @@ async function processVideo(
     job.voice =
       finalVoice;
 
+    job.progress =
+      20;
+
+    job.message =
+      "Criando cenas";
+
     const sceneDuration =
       finalDuration /
       images.length;
 
-    const sceneFiles = [];
+    const sceneFiles =
+      [];
 
     for (
       let i = 0;
       i < imageFiles.length;
       i++
     ) {
-
-      const scene =
+      const scenePath =
         path.join(
           jobDir,
           `scene-${i}.mp4`
@@ -1526,7 +1463,7 @@ async function processVideo(
       job.message =
         `Criando cena ${i + 1} de ${imageFiles.length}`;
 
-      await run(
+      await runCommand(
         "ffmpeg",
         [
           "-y",
@@ -1538,7 +1475,12 @@ async function processVideo(
           imageFiles[i],
 
           "-vf",
-          "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(zoom+0.0005,1.06)':d=1:s=1080x1920:fps=30,format=yuv420p",
+          [
+            "scale=1080:1920:force_original_aspect_ratio=increase",
+            "crop=1080:1920",
+            "zoompan=z='min(zoom+0.0005,1.06)':d=1:s=1080x1920:fps=30",
+            "format=yuv420p"
+          ].join(","),
 
           "-t",
           String(
@@ -1560,12 +1502,12 @@ async function processVideo(
           "-pix_fmt",
           "yuv420p",
 
-          scene
+          scenePath
         ]
       );
 
       sceneFiles.push(
-        scene
+        scenePath
       );
     }
 
@@ -1575,33 +1517,33 @@ async function processVideo(
     job.message =
       "Juntando cenas";
 
-    const concat =
+    const concatList =
       path.join(
         jobDir,
         "concat.txt"
       );
 
-    fs.writeFileSync(
-
-      concat,
-
+    const concatContent =
       sceneFiles
         .map(
-          f =>
-            `file '${f}'`
+          file =>
+            `file '${file}'`
         )
-        .join("\n"),
+        .join("\n");
 
+    fs.writeFileSync(
+      concatList,
+      concatContent,
       "utf8"
     );
 
-    const merged =
+    const mergedVideo =
       path.join(
         jobDir,
         "merged.mp4"
       );
 
-    await run(
+    await runCommand(
       "ffmpeg",
       [
         "-y",
@@ -1613,12 +1555,12 @@ async function processVideo(
         "0",
 
         "-i",
-        concat,
+        concatList,
 
         "-c",
         "copy",
 
-        merged
+        mergedVideo
       ]
     );
 
@@ -1628,19 +1570,19 @@ async function processVideo(
     job.message =
       "Adicionando narracao pt-BR";
 
-    const withAudio =
+    const videoWithAudio =
       path.join(
         jobDir,
         "video-audio.mp4"
       );
 
-    await run(
+    await runCommand(
       "ffmpeg",
       [
         "-y",
 
         "-i",
-        merged,
+        mergedVideo,
 
         "-i",
         audioPath,
@@ -1677,7 +1619,7 @@ async function processVideo(
         "-movflags",
         "+faststart",
 
-        withAudio
+        videoWithAudio
       ]
     );
 
@@ -1687,17 +1629,20 @@ async function processVideo(
     job.message =
       "Adicionando legendas sincronizadas";
 
-    const output =
+    const outputPath =
       path.join(
         OUTPUT_DIR,
         `${jobId}.mp4`
       );
 
     if (
-      finalCaptions.length
+      Array.isArray(
+        finalCaptions
+      ) &&
+      finalCaptions.length >
+        0
     ) {
-
-      const ass =
+      const assPath =
         path.join(
           jobDir,
           "legendas.ass"
@@ -1705,20 +1650,20 @@ async function processVideo(
 
       createAssFile(
         finalCaptions,
-        ass,
+        assPath,
         finalDuration
       );
 
-      await run(
+      await runCommand(
         "ffmpeg",
         [
           "-y",
 
           "-i",
-          withAudio,
+          videoWithAudio,
 
           "-vf",
-          `ass=${ass}`,
+          `ass=${assPath}`,
 
           "-c:v",
           "libx264",
@@ -1741,164 +1686,232 @@ async function processVideo(
           "-movflags",
           "+faststart",
 
-          output
+          outputPath
         ]
       );
 
     } else {
 
       fs.copyFileSync(
-        withAudio,
-        output
+        videoWithAudio,
+        outputPath
       );
     }
 
-    Object.assign(
-      job,
-      {
+    job.status =
+      "completed";
 
-        status:
-          "completed",
+    job.progress =
+      100;
 
-        progress:
-          100,
+    job.message =
+      "Video concluido";
 
-        message:
-          "Video concluido",
+    job.videoUrl =
+      `${publicBaseUrl()}/videos/${jobId}.mp4`;
 
-        videoUrl:
-          `${publicBaseUrl()}/videos/${jobId}.mp4`,
+    job.resolution =
+      "1080x1920";
 
-        resolution:
-          "1080x1920",
+    job.fps =
+      30;
 
-        fps:
-          30,
+    job.format =
+      "mp4";
 
-        format:
-          "mp4",
+    job.duration =
+      Number(
+        finalDuration.toFixed(
+          3
+        )
+      );
 
-        duration:
-          Number(
-            finalDuration
-              .toFixed(3)
-          ),
+    job.language =
+      DEFAULT_LANGUAGE;
 
-        language:
-          DEFAULT_LANGUAGE,
+    job.voice =
+      finalVoice;
 
-        voice:
-          finalVoice,
+    job.narrationProvider =
+      narrationProvider;
 
-        narrationProvider,
+    job.captionCount =
+      finalCaptions.length;
 
-        captionCount:
-          finalCaptions.length
-      }
+    console.log(
+      `VIDEO CONCLUIDO: ${job.videoUrl}`
     );
 
   } catch (error) {
-
     console.error(
-      "ERRO VIDEO:",
+      "ERRO NO JOB:",
       error
     );
 
-    Object.assign(
-      job,
-      {
+    job.status =
+      "error";
 
-        status:
-          "error",
+    job.progress =
+      0;
 
-        progress:
-          0,
+    job.message =
+      "Erro ao gerar video";
 
-        message:
-          "Erro ao gerar video",
-
-        error:
-          error?.message ||
-          String(error)
-      }
-    );
+    job.error =
+      error?.message ||
+      String(error);
   }
 }
 
 /* =========================================================
-   POST GERAR IMAGENS
+   HOME
+========================================================= */
+
+app.get(
+  "/",
+  (req, res) => {
+    res.json({
+      success:
+        true,
+
+      service:
+        "Curioso AI Video API",
+
+      status:
+        "online",
+
+      defaultLanguage:
+        DEFAULT_LANGUAGE,
+
+      defaultVoice:
+        DEFAULT_VOICE,
+
+      narrationProvider:
+        "edge-tts",
+
+      automaticCaptions:
+        true,
+
+      imageGeneration:
+        true,
+
+      imageProvider:
+        "cloudflare",
+
+      defaultImageModel:
+        DEFAULT_IMAGE_MODEL,
+
+      resolution:
+        "1080x1920",
+
+      fps:
+        30
+    });
+  }
+);
+
+/* =========================================================
+   HEALTH
+========================================================= */
+
+app.get(
+  "/health",
+  (req, res) => {
+
+    execFile(
+      "ffmpeg",
+      [
+        "-version"
+      ],
+      ffmpegError => {
+
+        execFile(
+          "ffprobe",
+          [
+            "-version"
+          ],
+          ffprobeError => {
+
+            res.json({
+              success:
+                true,
+
+              status:
+                "healthy",
+
+              ffmpeg:
+                !ffmpegError,
+
+              ffprobe:
+                !ffprobeError,
+
+              edgeTts:
+                true,
+
+              cloudflareConfigured:
+                Boolean(
+                  process.env
+                    .CLOUDFLARE_ACCOUNT_ID &&
+                  process.env
+                    .CLOUDFLARE_API_TOKEN
+                ),
+
+              imageProvider:
+                process.env
+                  .IMAGE_PROVIDER ||
+                "cloudflare",
+
+              defaultImageModel:
+                DEFAULT_IMAGE_MODEL,
+
+              language:
+                DEFAULT_LANGUAGE,
+
+              defaultVoice:
+                DEFAULT_VOICE
+            });
+          }
+        );
+      }
+    );
+  }
+);
+
+/* =========================================================
+   GERAR IMAGENS
 ========================================================= */
 
 app.post(
   "/generate-images",
   requireApiKey,
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
 
-    const {
-
-      scenes,
-
-      model =
-        DEFAULT_IMAGE_MODEL,
-
-      style,
-
-      enhance =
-        true,
-
-      safe =
-        true
-
-    } =
-      req.body || {};
+    const scenes =
+      normalizeImagePrompts(
+        req.body || {}
+      );
 
     if (
-      !process.env
-        .POLLINATIONS_API_KEY
-    ) {
-
-      return res
-        .status(503)
-        .json({
-
-          success:
-            false,
-
-          error:
-            "POLLINATIONS_API_KEY nao configurada no Render."
-        });
-    }
-
-    if (
-      !Array.isArray(
-        scenes
-      ) ||
       !scenes.length
     ) {
-
       return res
         .status(400)
         .json({
-
           success:
             false,
 
           error:
-            "Informe scenes com pelo menos uma cena."
+            "Informe pelo menos um prompt em prompt, prompts ou scenes."
         });
     }
 
     if (
-      scenes.length > 20
+      scenes.length >
+      20
     ) {
-
       return res
         .status(400)
         .json({
-
           success:
             false,
 
@@ -1907,41 +1920,56 @@ app.post(
         });
     }
 
-    for (
-      let i = 0;
-      i < scenes.length;
-      i++
+    const provider =
+      String(
+        process.env
+          .IMAGE_PROVIDER ||
+        "cloudflare"
+      ).toLowerCase();
+
+    if (
+      provider !==
+      "cloudflare"
     ) {
+      return res
+        .status(400)
+        .json({
+          success:
+            false,
 
-      if (
-        !cleanText(
-          scenes[i]
-            ?.imagePrompt ||
-          scenes[i]
-            ?.prompt
-        )
-      ) {
+          error:
+            "IMAGE_PROVIDER deve estar configurado como cloudflare."
+        });
+    }
 
-        return res
-          .status(400)
-          .json({
+    if (
+      !process.env
+        .CLOUDFLARE_ACCOUNT_ID ||
+      !process.env
+        .CLOUDFLARE_API_TOKEN
+    ) {
+      return res
+        .status(503)
+        .json({
+          success:
+            false,
 
-            success:
-              false,
-
-            error:
-              `Cena ${i + 1} sem imagePrompt.`
-          });
-      }
+          error:
+            "Cloudflare nao configurado no Render."
+        });
     }
 
     const jobId =
       crypto.randomUUID();
 
+    const model =
+      getCloudflareImageModel(
+        req.body?.model
+      );
+
     imageJobs.set(
       jobId,
       {
-
         jobId,
 
         status:
@@ -1953,6 +1981,11 @@ app.post(
         message:
           "Geracao de imagens iniciada",
 
+        provider:
+          "cloudflare",
+
+        model,
+
         totalImages:
           scenes.length,
 
@@ -1961,8 +1994,6 @@ app.post(
 
         currentScene:
           null,
-
-        model,
 
         resolution:
           "1080x1920",
@@ -1976,31 +2007,24 @@ app.post(
     );
 
     setImmediate(
-      () =>
-        processImageBatch(
+      () => {
+
+        processImageJob(
           jobId,
           {
+            ...(req.body || {}),
+
             scenes,
-            model,
-            style,
 
-            enhance:
-              Boolean(
-                enhance
-              ),
-
-            safe:
-              Boolean(
-                safe
-              )
+            model
           }
-        )
+        );
+      }
     );
 
-    res
+    return res
       .status(202)
       .json({
-
         success:
           true,
 
@@ -2009,10 +2033,13 @@ app.post(
         status:
           "queued",
 
-        totalImages:
-          scenes.length,
+        provider:
+          "cloudflare",
 
         model,
+
+        totalImages:
+          scenes.length,
 
         message:
           "Geracao de imagens iniciada",
@@ -2024,16 +2051,13 @@ app.post(
 );
 
 /* =========================================================
-   STATUS IMAGENS
+   STATUS DAS IMAGENS
 ========================================================= */
 
 app.get(
   "/image-status/:jobId",
   requireApiKey,
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
 
     const job =
       imageJobs.get(
@@ -2041,11 +2065,9 @@ app.get(
       );
 
     if (!job) {
-
       return res
         .status(404)
         .json({
-
           success:
             false,
 
@@ -2054,7 +2076,7 @@ app.get(
         });
     }
 
-    res.json({
+    return res.json({
       success:
         true,
 
@@ -2070,15 +2092,11 @@ app.get(
 app.post(
   "/tts",
   requireApiKey,
-  async (
-    req,
-    res
-  ) => {
+  async (req, res) => {
 
     try {
 
       const {
-
         text,
 
         voice =
@@ -2099,83 +2117,79 @@ app.post(
         ).toLowerCase() !==
         "pt-br"
       ) {
-
         return res
           .status(400)
           .json({
-
             success:
               false,
 
             error:
-              "Somente pt-BR."
+              "Esta API esta configurada somente para portugues do Brasil (pt-BR)."
           });
       }
 
       if (
-        !cleanText(text)
+        !cleanText(
+          text
+        )
       ) {
-
         return res
           .status(400)
           .json({
-
             success:
               false,
 
             error:
-              "Informe text."
+              "Informe o campo text."
           });
       }
 
-      const id =
+      const ttsId =
         crypto.randomUUID();
 
-      const dir =
+      const ttsDir =
         path.join(
           TEMP_DIR,
-          `tts-${id}`
+          `tts-${ttsId}`
         );
 
       fs.mkdirSync(
-        dir,
+        ttsDir,
         {
           recursive: true
         }
       );
 
-      const tempAudio =
+      const tempAudioPath =
         path.join(
-          dir,
+          ttsDir,
           "narracao.mp3"
         );
 
       const result =
         await generateEdgeNarration({
-
           text,
 
           audioPath:
-            tempAudio,
+            tempAudioPath,
 
           voice,
 
           rate
         });
 
-      const publicAudio =
+      const publicAudioPath =
         path.join(
           OUTPUT_DIR,
-          `${id}.mp3`
+          `${ttsId}.mp3`
         );
 
       fs.copyFileSync(
-        tempAudio,
-        publicAudio
+        tempAudioPath,
+        publicAudioPath
       );
 
-      res.json({
-
+      return res.json({
         success:
           true,
 
@@ -2193,28 +2207,31 @@ app.post(
 
         duration:
           Number(
-            result.duration
-              .toFixed(3)
+            result.duration.toFixed(
+              3
+            )
           ),
 
         captions:
           result.captions,
 
         captionCount:
-          result
-            .captions
-            .length,
+          result.captions.length,
 
         audioUrl:
-          `${publicBaseUrl()}/videos/${id}.mp3`
+          `${publicBaseUrl()}/videos/${ttsId}.mp3`
       });
 
     } catch (error) {
 
-      res
+      console.error(
+        "ERRO EDGE TTS:",
+        error
+      );
+
+      return res
         .status(500)
         .json({
-
           success:
             false,
 
@@ -2233,23 +2250,14 @@ app.post(
 app.post(
   "/render",
   requireApiKey,
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
 
     const {
-
       images,
-
       audioUrl,
-
       text,
-
       narrationText,
-
       duration,
-
       captions,
 
       language =
@@ -2268,13 +2276,12 @@ app.post(
       !Array.isArray(
         images
       ) ||
-      !images.length
+      images.length ===
+        0
     ) {
-
       return res
         .status(400)
         .json({
-
           success:
             false,
 
@@ -2289,16 +2296,14 @@ app.post(
       ).toLowerCase() !==
       "pt-br"
     ) {
-
       return res
         .status(400)
         .json({
-
           success:
             false,
 
           error:
-            "Somente pt-BR."
+            "Esta API esta configurada somente para portugues do Brasil (pt-BR)."
         });
     }
 
@@ -2312,40 +2317,43 @@ app.post(
       !textToSpeak &&
       !audioUrl
     ) {
-
       return res
         .status(400)
         .json({
-
           success:
             false,
 
           error:
-            "Informe text/narrationText ou audioUrl."
+            "Informe text/narrationText para gerar a narracao automaticamente ou audioUrl para usar audio pronto."
         });
     }
 
     if (
       !textToSpeak &&
-      duration !== undefined &&
-      (
-        !Number.isFinite(
-          Number(duration)
-        ) ||
-        Number(duration) <= 0
-      )
+      duration !==
+        undefined
     ) {
+      const value =
+        Number(
+          duration
+        );
 
-      return res
-        .status(400)
-        .json({
+      if (
+        !Number.isFinite(
+          value
+        ) ||
+        value <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
 
-          success:
-            false,
-
-          error:
-            "Duracao invalida."
-        });
+            error:
+              "A duracao informada e invalida."
+          });
+      }
     }
 
     const jobId =
@@ -2354,7 +2362,6 @@ app.post(
     jobs.set(
       jobId,
       {
-
         jobId,
 
         status:
@@ -2365,9 +2372,7 @@ app.post(
 
         message:
           textToSpeak
-
             ? "Renderizacao iniciada com voz e legendas automaticas"
-
             : "Renderizacao iniciada",
 
         language:
@@ -2388,19 +2393,15 @@ app.post(
     );
 
     setImmediate(
-      () =>
+      () => {
+
         processVideo(
           jobId,
           {
-
             images,
-
             audioUrl,
-
             text,
-
             narrationText,
-
             duration,
 
             captions:
@@ -2414,13 +2415,13 @@ app.post(
 
             rate
           }
-        )
+        );
+      }
     );
 
-    res
+    return res
       .status(202)
       .json({
-
         success:
           true,
 
@@ -2451,9 +2452,7 @@ app.post(
 
         message:
           textToSpeak
-
             ? "Renderizacao iniciada com voz e legendas automaticas"
-
             : "Renderizacao iniciada",
 
         statusUrl:
@@ -2469,10 +2468,7 @@ app.post(
 app.get(
   "/status/:jobId",
   requireApiKey,
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
 
     const job =
       jobs.get(
@@ -2480,11 +2476,9 @@ app.get(
       );
 
     if (!job) {
-
       return res
         .status(404)
         .json({
-
           success:
             false,
 
@@ -2493,133 +2487,12 @@ app.get(
         });
     }
 
-    res.json({
-
+    return res.json({
       success:
         true,
 
       ...job
     });
-  }
-);
-
-/* =========================================================
-   HOME
-========================================================= */
-
-app.get(
-  "/",
-  (
-    req,
-    res
-  ) => {
-
-    res.json({
-
-      success:
-        true,
-
-      service:
-        "Curioso AI Video API",
-
-      status:
-        "online",
-
-      defaultLanguage:
-        DEFAULT_LANGUAGE,
-
-      defaultVoice:
-        DEFAULT_VOICE,
-
-      narrationProvider:
-        "edge-tts",
-
-      automaticCaptions:
-        true,
-
-      imageGeneration:
-        true,
-
-      imageProvider:
-        "pollinations",
-
-      defaultImageModel:
-        DEFAULT_IMAGE_MODEL,
-
-      resolution:
-        "1080x1920",
-
-      fps:
-        30
-    });
-  }
-);
-
-/* =========================================================
-   HEALTH
-========================================================= */
-
-app.get(
-  "/health",
-  (
-    req,
-    res
-  ) => {
-
-    execFile(
-      "ffmpeg",
-      [
-        "-version"
-      ],
-      (
-        ffmpegError
-      ) => {
-
-        execFile(
-          "ffprobe",
-          [
-            "-version"
-          ],
-          (
-            ffprobeError
-          ) => {
-
-            res.json({
-
-              success:
-                true,
-
-              status:
-                "healthy",
-
-              ffmpeg:
-                !ffmpegError,
-
-              ffprobe:
-                !ffprobeError,
-
-              edgeTts:
-                true,
-
-              pollinationsConfigured:
-                Boolean(
-                  process.env
-                    .POLLINATIONS_API_KEY
-                ),
-
-              language:
-                DEFAULT_LANGUAGE,
-
-              defaultVoice:
-                DEFAULT_VOICE,
-
-              defaultImageModel:
-                DEFAULT_IMAGE_MODEL
-            });
-          }
-        );
-      }
-    );
   }
 );
 
@@ -2637,16 +2510,15 @@ app.listen(
     );
 
     console.log(
-      `Edge TTS: ${DEFAULT_VOICE}`
+      `Idioma padrao: ${DEFAULT_LANGUAGE}`
     );
 
     console.log(
-      `Pollinations configurado: ${
-        Boolean(
-          process.env
-            .POLLINATIONS_API_KEY
-        )
-      }`
+      `Voz padrao: ${DEFAULT_VOICE}`
+    );
+
+    console.log(
+      `Imagem: ${DEFAULT_IMAGE_MODEL}`
     );
   }
 );
